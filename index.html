@@ -38,12 +38,10 @@ let state = {
   device: 'all',
   pageFilter: 'all',
   availablePages: [],
-  funnel: [],
   series: [],
   overviewSeries: [],
-  overviewChart: null,
+  mainChart: null,
   pageBreakdown: [],
-  chart: null,
   showAddTest: false,
   addTestError: '',
   editingTestId: null,
@@ -51,7 +49,6 @@ let state = {
   confirmingDeleteEventId: null,
   showAddEvent: false,
   addEventError: '',
-  addEventProgression: [],
   addEventType: 'click',
   liveConnected: false,
   livePulse: true,
@@ -130,40 +127,12 @@ async function loadTestOverview() {
   state.overviewSeries = toCumulative(Object.values(byDay));
 }
 
-async function loadFunnelAndSeries() {
+async function loadEventSeries() {
   const evt = state.events.find(e => e.name === state.selectedEvent);
-  if (!evt) { state.funnel = []; state.series = []; return; }
+  if (!evt) { state.series = []; state.pageBreakdown = []; return; }
 
   const { fromDate, toDate } = getActiveRange();
   const devicePayload = state.device === 'all' ? null : state.device;
-
-  // Find the funnel this event actually starts, by looking at funnel_steps
-  // directly rather than guessing a name, evt.name + '_progression' was
-  // fragile and silently broke for anything not following that pattern.
-  const stepMatch = await api(
-    'funnel_steps?select=funnel_id&step_order=eq.1&event_name=eq.' + encodeURIComponent(evt.name)
-  );
-
-  if (stepMatch && stepMatch[0]) {
-    const rows = await api('rpc/get_funnel_report', {
-      method: 'POST',
-      body: JSON.stringify({
-        p_funnel_id: stepMatch[0].funnel_id,
-        p_device: devicePayload,
-        p_start_date: fromDate,
-        p_end_date: toDate,
-        p_page_path: state.pageFilter === 'all' ? null : state.pageFilter,
-      }),
-    });
-    const byStep = {};
-    rows.forEach(r => {
-      if (!byStep[r.step_order]) byStep[r.step_order] = { name: r.event_name, control: 0, variant_a: 0 };
-      byStep[r.step_order][r.variant || 'unknown'] = r.sessions;
-    });
-    state.funnel = Object.values(byStep);
-  } else {
-    state.funnel = [];
-  }
 
   let seriesQuery = 'experiment_events?select=variant,created_at,page_path&event_name=eq.' + encodeURIComponent(evt.name) +
     '&created_at=gte.' + encodeURIComponent(fromDate) + '&order=created_at.asc';
@@ -239,27 +208,12 @@ async function deleteTrackedEvent(id) {
   if (!res.ok) throw new Error(await res.text());
 }
 
-async function createTrackedEvent(experimentId, name, type, target, progression) {
+async function createTrackedEvent(experimentId, name, type, target) {
   const rows = await fetch(SUPABASE_URL + '/rest/v1/tracked_events', {
     method: 'POST',
     headers: { ...headers, Prefer: 'return=representation' },
     body: JSON.stringify({ name, event_type: type, match_type: type === 'pageview' ? 'url_path' : 'selector', match_value: target, experiment_id: experimentId }),
   }).then(r => r.json());
-
-  if (progression.length) {
-    const fdRows = await fetch(SUPABASE_URL + '/rest/v1/funnel_definitions', {
-      method: 'POST',
-      headers: { ...headers, Prefer: 'return=representation' },
-      body: JSON.stringify({ name: name + '_progression' }),
-    }).then(r => r.json());
-    const funnelId = fdRows[0].id;
-    const steps = [name, ...progression].map((stepName, i) => ({ funnel_id: funnelId, step_order: i + 1, event_name: stepName }));
-    await fetch(SUPABASE_URL + '/rest/v1/funnel_steps', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(steps),
-    });
-  }
   return rows[0];
 }
 
@@ -272,7 +226,7 @@ function subscribeRealtime() {
       const evt = state.events.find(e => e.name === state.selectedEvent);
       const belongsToTest = state.events.some(e => e.name === payload.new.event_name);
       if (evt && payload.new.event_name === evt.name) {
-        await loadFunnelAndSeries();
+        await loadEventSeries();
       }
       if (belongsToTest) {
         await loadTestOverview();
@@ -288,17 +242,14 @@ function subscribeRealtime() {
 
 function renderLiveOnly() {
   if (state.view !== 'test') return;
-  const overviewDot = document.getElementById('overviewLiveDot');
-  if (overviewDot) {
-    overviewDot.style.background = state.liveConnected ? '#10B981' : '#CBD5E1';
-    overviewDot.style.opacity = state.liveConnected && state.livePulse ? '1' : '0.3';
+  const dot = document.getElementById('mainLiveDot');
+  if (dot) {
+    dot.style.background = state.liveConnected ? '#10B981' : '#CBD5E1';
+    dot.style.opacity = state.liveConnected && state.livePulse ? '1' : '0.3';
   }
-  const overviewPanel = document.getElementById('overviewPanel');
-  if (overviewPanel) overviewPanel.innerHTML = renderOverviewPanelInner();
-  const funnelPanel = document.getElementById('funnelPanel');
-  if (funnelPanel) funnelPanel.innerHTML = renderFunnelPanelInner();
-  if (document.getElementById('seriesChart')) drawChart();
-  if (document.getElementById('overviewChart')) drawOverviewChart();
+  const chartPanel = document.getElementById('chartPanel');
+  if (chartPanel) chartPanel.innerHTML = renderChartPanelInner();
+  if (document.getElementById('mainChart')) drawMainChart();
 }
 
 function badge(text, tone) {
@@ -365,56 +316,38 @@ function renderPicker() {
   );
 }
 
-function renderFunnelPanelInner() {
-  const evt = state.events.find(e => e.name === state.selectedEvent);
+function renderChartPanelInner() {
   const test = state.experiments.find(t => t.id === state.testId);
-  if (!evt) return '<p class="text-xs text-slate-400 text-center py-10">Pick an event on the left to see its performance for this test.</p>';
+  const showingAll = !state.selectedEvent;
+  const evt = state.events.find(e => e.name === state.selectedEvent);
+  const activeSeries = showingAll ? state.overviewSeries : state.series;
 
-  const funnelRows = state.funnel.map((s, i) => {
-    const max = state.funnel[0] ? (state.funnel[0].control + state.funnel[0].variant_a) : 1;
-    const stepUplift = s.control ? Math.round(((s.variant_a - s.control) / s.control) * 100) : 0;
-    return (
-      '<div>' +
-        '<div class="flex items-center justify-between mb-1">' +
-          '<p class="text-[11px] font-mono text-slate-500">' + (i === 0 ? evt.name + ' (start)' : s.name) + '</p>' +
-          '<span class="text-[11px] font-medium tabular-nums ' + (stepUplift >= 0 ? 'text-emerald-600' : 'text-rose-600') + '">' + (stepUplift >= 0 ? '+' : '') + stepUplift + '%</span>' +
-        '</div>' +
-        ['control', 'variant_a'].map(v => (
-          '<div class="flex items-center gap-2 mb-1">' +
-            '<div class="flex-1 bg-slate-100 rounded h-4 relative overflow-hidden"><div class="h-full rounded" style="width:' + ((s[v] || 0) / (max / 2) * 100) + '%;background:' + VARIANT_COLORS[v] + '"></div></div>' +
-            '<span class="text-xs w-10 text-right tabular-nums text-slate-700">' + (s[v] || 0) + '</span>' +
-          '</div>'
-        )).join('') +
-      '</div>'
-    );
-  }).join('');
-
-  const convC = state.funnel.length > 1 && state.funnel[0].control ? Math.round((state.funnel[state.funnel.length - 1].control / state.funnel[0].control) * 100) : 0;
-  const convV = state.funnel.length > 1 && state.funnel[0].variant_a ? Math.round((state.funnel[state.funnel.length - 1].variant_a / state.funnel[0].variant_a) * 100) : 0;
+  const lastPoint = activeSeries[activeSeries.length - 1] || { control: 0, variant_a: 0 };
+  const totalControl = lastPoint.control;
+  const totalVariant = lastPoint.variant_a;
+  const uplift = totalControl ? Math.round(((totalVariant - totalControl) / totalControl) * 100) : 0;
 
   return (
     '<div class="flex items-center justify-between mb-1">' +
-      '<div><p class="text-[11px] font-semibold text-slate-400 uppercase tracking-wide">Progression beyond this event</p>' +
-      '<p class="text-sm font-mono text-slate-800 mt-0.5">' + evt.name + '</p></div>' +
+      '<div>' +
+        '<div class="flex items-center gap-2">' +
+          '<span id="mainLiveDot" style="width:6px;height:6px;border-radius:50%;display:inline-block;background:#CBD5E1"></span>' +
+          '<p class="text-[11px] font-semibold text-slate-400 uppercase tracking-wide">' + (showingAll ? 'All events, this test' : evt.name) + '</p>' +
+        '</div>' +
+        '<p class="text-sm text-slate-800 mt-0.5">Control vs variant, updates live as events land</p>' +
+      '</div>' +
       badge(test ? test.name : '', 'accent') +
     '</div>' +
-    (state.funnel.length > 1
-      ? (
-        '<div class="flex items-center gap-4 text-xs text-slate-500 mt-3 mb-3">' +
-          '<span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-sm inline-block" style="background:' + VARIANT_COLORS.control + '"></span>control converts <span class="font-mono text-slate-700">' + convC + '%</span></span>' +
-          '<span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-sm inline-block" style="background:' + VARIANT_COLORS.variant_a + '"></span>variant_a converts <span class="font-mono text-slate-700">' + convV + '%</span></span>' +
-          '<span class="font-medium ' + (convV >= convC ? 'text-emerald-600' : 'text-rose-600') + '">' + (convV >= convC ? '+' : '') + (convV - convC) + 'pt</span>' +
-        '</div>' +
-        '<div class="space-y-3 mb-5">' + funnelRows + '</div>'
-      )
-      : '<p class="text-xs text-slate-400 mt-4 py-6 text-center">No progression steps defined for this event yet in funnel_steps.</p>'
+    '<div class="flex gap-3 text-xs text-slate-500 mt-3 mb-1">' +
+      '<span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-sm inline-block" style="background:' + VARIANT_COLORS.control + '"></span>control &middot; <span class="font-mono text-slate-700">' + totalControl + '</span></span>' +
+      '<span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-sm inline-block" style="background:' + VARIANT_COLORS.variant_a + '"></span>variant_a &middot; <span class="font-mono text-slate-700">' + totalVariant + '</span></span>' +
+      '<span class="font-medium ' + (uplift >= 0 ? 'text-emerald-600' : 'text-rose-600') + '">' + (uplift >= 0 ? '+' : '') + uplift + '%</span>' +
+    '</div>' +
+    (activeSeries.length
+      ? '<div style="position:relative;height:220px" class="mt-3"><canvas id="mainChart" role="img" aria-label="Line chart, control versus variant_a"></canvas></div>'
+      : '<p class="text-xs text-slate-400 py-8 text-center">No events recorded yet for this range.</p>'
     ) +
-    '<p class="text-[11px] font-semibold text-slate-400 uppercase tracking-wide mb-2">' + (evt.event_type === 'click' ? 'Clicks' : 'Views') + ' over time</p>' +
-    (state.series.length
-      ? '<div style="position:relative;height:200px"><canvas id="seriesChart" role="img" aria-label="Line chart of ' + evt.name + ' events over time, control versus variant_a"></canvas></div>'
-      : '<p class="text-xs text-slate-400 py-6 text-center">No events recorded yet for this range.</p>'
-    ) +
-    (state.pageBreakdown.length ? renderPageBreakdown() : '')
+    (!showingAll && state.pageBreakdown.length ? renderPageBreakdown() : '')
   );
 }
 
@@ -442,6 +375,15 @@ function renderPageBreakdown() {
 
 function renderTestDetail() {
   const test = state.experiments.find(t => t.id === state.testId);
+
+  const allEventsRow =
+    '<div class="flex items-center justify-between py-2.5 border-b border-slate-100 mb-1 px-1.5 -mx-1.5 rounded ' +
+    (!state.selectedEvent ? 'bg-indigo-50/60' : 'hover:bg-slate-50') + '">' +
+      '<button data-select-all-events class="min-w-0 text-left flex-1">' +
+        '<p class="text-xs font-medium text-slate-800">All events</p>' +
+        '<p class="text-[11px] text-slate-400">Combined view across every tracked event</p>' +
+      '</button>' +
+    '</div>';
 
   const eventRows = state.events.length
     ? state.events.map(e => {
@@ -525,10 +467,9 @@ function renderTestDetail() {
           '<button data-toggle-add-event class="text-xs font-medium text-indigo-700 hover:text-indigo-800">+ Add event</button>' +
         '</div>' +
         renderAddEventForm() +
-        '<div class="flex flex-col">' + eventRows + '</div>' +
+        '<div class="flex flex-col">' + allEventsRow + eventRows + '</div>' +
       '</div>' +
-      '<div id="overviewPanel" class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm mb-5">' + renderOverviewPanelInner() + '</div>' +
-      '<div id="funnelPanel" class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm">' + renderFunnelPanelInner() + '</div>' +
+      '<div id="chartPanel" class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm">' + renderChartPanelInner() + '</div>' +
     '</div>'
   );
 }
@@ -538,13 +479,6 @@ function renderAddEventForm() {
   const typeOptions = ['click', 'pageview'].map(t =>
     '<option value="' + t + '"' + (state.addEventType === t ? ' selected' : '') + '>' + (t === 'click' ? 'Click' : 'Pageview') + '</option>'
   ).join('');
-  const progressionChips = state.allEventNames
-    .filter(name => name !== (document.getElementById('newEventName') ? document.getElementById('newEventName').value.trim() : ''))
-    .map(name => {
-    const on = state.addEventProgression.includes(name);
-    return '<button type="button" data-toggle-progression="' + name + '" class="text-[11px] font-mono px-2 py-1 rounded border ' +
-      (on ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-white border-slate-300 text-slate-500') + '">' + name + '</button>';
-  }).join('');
 
   return (
     '<div class="mb-4 p-3.5 bg-slate-50 border border-slate-200 rounded-lg space-y-2.5">' +
@@ -556,9 +490,6 @@ function renderAddEventForm() {
         '<div class="flex-[2]"><label class="text-[11px] text-slate-500 block mb-1">' + (state.addEventType === 'pageview' ? 'URL path' : 'CSS selector') + '</label>' +
         '<input id="newEventTarget" placeholder="' + (state.addEventType === 'pageview' ? '/cart' : '#hero-shop-now') + '" class="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5 font-mono" /></div>' +
       '</div>' +
-      '<div><label class="text-[11px] text-slate-500 block mb-1">What happens after this event</label>' +
-      '<p class="text-[10px] text-slate-400 mb-1.5">Pick what counts as progression, specific to this test.</p>' +
-      '<div class="flex flex-wrap gap-1.5">' + progressionChips + '</div></div>' +
       (state.addEventError ? '<p class="text-xs text-rose-600">' + state.addEventError + '</p>' : '') +
       '<div class="flex gap-2 pt-1">' +
         '<button data-save-event class="text-xs font-medium bg-indigo-700 text-white rounded-md px-3 py-1.5 hover:bg-indigo-800">Save event</button>' +
@@ -568,82 +499,18 @@ function renderAddEventForm() {
   );
 }
 
-function renderOverviewPanelInner() {
-  const lastPoint = state.overviewSeries[state.overviewSeries.length - 1] || { control: 0, variant_a: 0 };
-  const totalControl = lastPoint.control;
-  const totalVariant = lastPoint.variant_a;
-  const uplift = totalControl ? Math.round(((totalVariant - totalControl) / totalControl) * 100) : 0;
-
-  return (
-    '<div class="flex items-center justify-between mb-1">' +
-      '<div>' +
-        '<div class="flex items-center gap-2">' +
-          '<span id="overviewLiveDot" style="width:6px;height:6px;border-radius:50%;display:inline-block;background:#CBD5E1"></span>' +
-          '<p class="text-[11px] font-semibold text-slate-400 uppercase tracking-wide">All events, this test</p>' +
-        '</div>' +
-        '<p class="text-sm text-slate-800 mt-0.5">Control vs variant, updates live as events land</p>' +
-      '</div>' +
-      '<div class="flex gap-3 text-xs text-slate-500">' +
-        '<span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-sm inline-block" style="background:' + VARIANT_COLORS.control + '"></span>control &middot; <span class="font-mono text-slate-700">' + totalControl + '</span></span>' +
-        '<span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-sm inline-block" style="background:' + VARIANT_COLORS.variant_a + '"></span>variant_a &middot; <span class="font-mono text-slate-700">' + totalVariant + '</span></span>' +
-        '<span class="font-medium ' + (uplift >= 0 ? 'text-emerald-600' : 'text-rose-600') + '">' + (uplift >= 0 ? '+' : '') + uplift + '%</span>' +
-      '</div>' +
-    '</div>' +
-    (state.overviewSeries.length
-      ? '<div style="position:relative;height:200px" class="mt-3"><canvas id="overviewChart" role="img" aria-label="Line chart of all tracked events for this test over time, control versus variant_a"></canvas></div>'
-      : '<p class="text-xs text-slate-400 py-8 text-center">No events recorded yet for this range.</p>'
-    )
-  );
-}
-
-function drawOverviewChart() {
-  if (state.overviewChart) { state.overviewChart.destroy(); state.overviewChart = null; }
-  const canvas = document.getElementById('overviewChart');
-  if (!canvas || !state.overviewSeries.length) return;
-  state.overviewChart = new Chart(canvas, {
+function drawMainChart() {
+  if (state.mainChart) { state.mainChart.destroy(); state.mainChart = null; }
+  const canvas = document.getElementById('mainChart');
+  const activeSeries = state.selectedEvent ? state.series : state.overviewSeries;
+  if (!canvas || !activeSeries.length) return;
+  state.mainChart = new Chart(canvas, {
     type: 'line',
     data: {
-      labels: state.overviewSeries.map(s => s.date),
+      labels: activeSeries.map(s => s.date),
       datasets: [
-        { label: 'control', data: state.overviewSeries.map(s => s.control || 0), borderColor: VARIANT_COLORS.control, backgroundColor: 'transparent', tension: 0.4, cubicInterpolationMode: 'monotone', pointRadius: 2, borderWidth: 2 },
-        { label: 'variant_a', data: state.overviewSeries.map(s => s.variant_a || 0), borderColor: VARIANT_COLORS.variant_a, backgroundColor: 'transparent', tension: 0.4, cubicInterpolationMode: 'monotone', pointRadius: 2, borderWidth: 2 },
-      ],
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: false,
-      interaction: { mode: 'index', intersect: false },
-      plugins: {
-        legend: { display: false },
-        tooltip: {
-          callbacks: {
-            afterBody: (items) => {
-              const c = items.find(i => i.dataset.label === 'control');
-              const v = items.find(i => i.dataset.label === 'variant_a');
-              if (!c || !v || !c.parsed.y) return '';
-              const pct = Math.round(((v.parsed.y - c.parsed.y) / c.parsed.y) * 100);
-              return (pct >= 0 ? '+' : '') + pct + '% vs control';
-            },
-          },
-        },
-      },
-      scales: { y: { beginAtZero: true } },
-    },
-  });
-}
-
-function drawChart() {
-  if (state.chart) { state.chart.destroy(); state.chart = null; }
-  const canvas = document.getElementById('seriesChart');
-  if (!canvas || !state.series.length) return;
-  state.chart = new Chart(canvas, {
-    type: 'line',
-    data: {
-      labels: state.series.map(s => s.date),
-      datasets: [
-        { label: 'control', data: state.series.map(s => s.control || 0), borderColor: VARIANT_COLORS.control, backgroundColor: 'transparent', tension: 0.4, cubicInterpolationMode: 'monotone', pointRadius: 2, borderWidth: 2 },
-        { label: 'variant_a', data: state.series.map(s => s.variant_a || 0), borderColor: VARIANT_COLORS.variant_a, backgroundColor: 'transparent', tension: 0.4, cubicInterpolationMode: 'monotone', pointRadius: 2, borderWidth: 2 },
+        { label: 'control', data: activeSeries.map(s => s.control || 0), borderColor: VARIANT_COLORS.control, backgroundColor: 'transparent', tension: 0.4, cubicInterpolationMode: 'monotone', pointRadius: 2, borderWidth: 2 },
+        { label: 'variant_a', data: activeSeries.map(s => s.variant_a || 0), borderColor: VARIANT_COLORS.variant_a, backgroundColor: 'transparent', tension: 0.4, cubicInterpolationMode: 'monotone', pointRadius: 2, borderWidth: 2 },
       ],
     },
     options: {
@@ -674,7 +541,7 @@ async function render() {
   const app = document.getElementById('app');
   app.innerHTML = state.view === 'picker' ? renderPicker() : renderTestDetail();
   wireEvents();
-  if (state.view === 'test') { drawChart(); drawOverviewChart(); }
+  if (state.view === 'test') { drawMainChart(); }
 }
 
 function wireEvents() {
@@ -684,12 +551,10 @@ function wireEvents() {
       state.testId = el.getAttribute('data-open-test');
       state.view = 'test';
       state.showAddEvent = false;
-      state.addEventProgression = [];
       await loadEventsForTest(state.testId);
       state.pageFilter = 'all';
       await loadAvailablePages();
-      state.selectedEvent = state.events[0] ? state.events[0].name : null;
-      if (state.selectedEvent) await loadFunnelAndSeries();
+      state.selectedEvent = null;
       await loadTestOverview();
       render();
     });
@@ -737,9 +602,14 @@ function wireEvents() {
   document.querySelectorAll('[data-select-event]').forEach(el => {
     el.addEventListener('click', async () => {
       state.selectedEvent = el.getAttribute('data-select-event');
-      await loadFunnelAndSeries();
+      await loadEventSeries();
       render();
     });
+  });
+  const selectAllEvents = document.querySelector('[data-select-all-events]');
+  if (selectAllEvents) selectAllEvents.addEventListener('click', () => {
+    state.selectedEvent = null;
+    render();
   });
   document.querySelectorAll('[data-delete-event]').forEach(el => {
     el.addEventListener('click', (ev) => {
@@ -765,8 +635,7 @@ function wireEvents() {
       await loadEventsForTest(state.testId);
       await loadAvailablePages();
       if (state.selectedEvent === deletedName) {
-        state.selectedEvent = state.events[0] ? state.events[0].name : null;
-        if (state.selectedEvent) await loadFunnelAndSeries();
+        state.selectedEvent = null;
       }
       await loadTestOverview();
       render();
@@ -781,7 +650,7 @@ function wireEvents() {
       const rangeValue = el.getAttribute('data-range');
       state.rangeDays = rangeValue === 'today' ? 'today' : parseInt(rangeValue, 10);
       state.useCustomRange = false;
-      await loadFunnelAndSeries();
+      await loadEventSeries();
       await loadTestOverview();
       render();
     });
@@ -789,7 +658,7 @@ function wireEvents() {
   const toggleCustomRange = document.querySelector('[data-toggle-custom-range]');
   if (toggleCustomRange) toggleCustomRange.addEventListener('click', async () => {
     state.useCustomRange = !state.useCustomRange;
-    if (!state.useCustomRange) { await loadFunnelAndSeries(); await loadTestOverview(); }
+    if (!state.useCustomRange) { await loadEventSeries(); await loadTestOverview(); }
     render();
   });
   const applyCustomRange = document.querySelector('[data-apply-custom-range]');
@@ -797,14 +666,14 @@ function wireEvents() {
     state.customFrom = document.getElementById('customFromInput').value;
     state.customTo = document.getElementById('customToInput').value;
     if (!state.customFrom) return;
-    await loadFunnelAndSeries();
+    await loadEventSeries();
     await loadTestOverview();
     render();
   });
   document.querySelectorAll('[data-device]').forEach(el => {
     el.addEventListener('click', async () => {
       state.device = el.getAttribute('data-device');
-      await loadFunnelAndSeries();
+      await loadEventSeries();
       await loadTestOverview();
       render();
     });
@@ -812,7 +681,7 @@ function wireEvents() {
   const pageFilterSelect = document.getElementById('pageFilterSelect');
   if (pageFilterSelect) pageFilterSelect.addEventListener('change', async () => {
     state.pageFilter = pageFilterSelect.value;
-    await loadFunnelAndSeries();
+    await loadEventSeries();
     await loadTestOverview();
     render();
   });
@@ -867,30 +736,19 @@ function wireEvents() {
   const typeSelect = document.getElementById('newEventType');
   if (typeSelect) typeSelect.addEventListener('change', () => { state.addEventType = typeSelect.value; render(); });
 
-  document.querySelectorAll('[data-toggle-progression]').forEach(el => {
-    el.addEventListener('click', () => {
-      const name = el.getAttribute('data-toggle-progression');
-      state.addEventProgression = state.addEventProgression.includes(name)
-        ? state.addEventProgression.filter(s => s !== name)
-        : [...state.addEventProgression, name];
-      render();
-    });
-  });
-
   const saveEvent = document.querySelector('[data-save-event]');
   if (saveEvent) saveEvent.addEventListener('click', async () => {
     const name = document.getElementById('newEventName').value.trim();
     const target = document.getElementById('newEventTarget').value.trim();
     if (!name || !target) { state.addEventError = 'Add a name and a target before saving.'; render(); return; }
     try {
-      await createTrackedEvent(state.testId, name, state.addEventType, target, state.addEventProgression);
+      await createTrackedEvent(state.testId, name, state.addEventType, target);
       state.showAddEvent = false;
       state.addEventError = '';
-      state.addEventProgression = [];
       await loadEventsForTest(state.testId);
       await loadAvailablePages();
       state.selectedEvent = name;
-      await loadFunnelAndSeries();
+      await loadEventSeries();
       await loadTestOverview();
       render();
     } catch (e) {
