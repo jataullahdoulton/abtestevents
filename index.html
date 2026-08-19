@@ -31,6 +31,10 @@ let state = {
   testId: null,
   selectedEvent: null,
   rangeDays: 14,
+  customFrom: '',
+  customTo: '',
+  useCustomRange: false,
+  device: 'all',
   funnel: [],
   series: [],
   chart: null,
@@ -71,13 +75,25 @@ async function loadFunnelAndSeries() {
   const evt = state.events.find(e => e.name === state.selectedEvent);
   if (!evt) { state.funnel = []; state.series = []; return; }
 
-  const fromDate = new Date(Date.now() - state.rangeDays * 86400000).toISOString();
+  const { fromDate, toDate } = getActiveRange();
+  const devicePayload = state.device === 'all' ? null : state.device;
 
-  const fd = await api('funnel_definitions?name=eq.' + encodeURIComponent(evt.name + '_progression') + '&select=id');
-  if (fd && fd[0]) {
+  // Find the funnel this event actually starts, by looking at funnel_steps
+  // directly rather than guessing a name, evt.name + '_progression' was
+  // fragile and silently broke for anything not following that pattern.
+  const stepMatch = await api(
+    'funnel_steps?select=funnel_id&step_order=eq.1&event_name=eq.' + encodeURIComponent(evt.name)
+  );
+
+  if (stepMatch && stepMatch[0]) {
     const rows = await api('rpc/get_funnel_report', {
       method: 'POST',
-      body: JSON.stringify({ p_funnel_id: fd[0].id }),
+      body: JSON.stringify({
+        p_funnel_id: stepMatch[0].funnel_id,
+        p_device: devicePayload,
+        p_start_date: fromDate,
+        p_end_date: toDate,
+      }),
     });
     const byStep = {};
     rows.forEach(r => {
@@ -89,10 +105,12 @@ async function loadFunnelAndSeries() {
     state.funnel = [];
   }
 
-  const rows = await api(
-    'experiment_events?select=variant,created_at&event_name=eq.' + encodeURIComponent(evt.name) +
-    '&created_at=gte.' + encodeURIComponent(fromDate) + '&order=created_at.asc'
-  );
+  let seriesQuery = 'experiment_events?select=variant,created_at&event_name=eq.' + encodeURIComponent(evt.name) +
+    '&created_at=gte.' + encodeURIComponent(fromDate) + '&order=created_at.asc';
+  if (toDate) seriesQuery += '&created_at=lte.' + encodeURIComponent(toDate);
+  if (devicePayload) seriesQuery += '&device_type=eq.' + encodeURIComponent(devicePayload);
+
+  const rows = await api(seriesQuery);
   const byDay = {};
   rows.forEach(r => {
     const day = new Date(r.created_at).toLocaleDateString([], { month: 'short', day: 'numeric' });
@@ -100,6 +118,15 @@ async function loadFunnelAndSeries() {
     byDay[day][r.variant || 'unknown'] = (byDay[day][r.variant || 'unknown'] || 0) + 1;
   });
   state.series = Object.values(byDay);
+}
+
+function getActiveRange() {
+  if (state.useCustomRange && state.customFrom) {
+    const fromDate = new Date(state.customFrom + 'T00:00:00Z').toISOString();
+    const toDate = state.customTo ? new Date(state.customTo + 'T23:59:59Z').toISOString() : null;
+    return { fromDate, toDate };
+  }
+  return { fromDate: new Date(Date.now() - state.rangeDays * 86400000).toISOString(), toDate: null };
 }
 
 async function createExperiment(name, shopliftKey) {
@@ -190,8 +217,7 @@ function badge(text, tone) {
 function renderPicker() {
   const rows = state.experiments.map(t => (
     '<div data-open-test="' + t.id + '" class="w-full flex items-center justify-between bg-white border border-slate-200 rounded-lg p-4 shadow-sm hover:border-indigo-300 hover:shadow cursor-pointer">' +
-      '<div><p class="text-sm font-medium text-slate-900">' + t.name + '</p>' +
-      '<p class="text-[11px] text-slate-400 mt-0.5 font-mono">' + t.shoplift_key + '</p></div>' +
+      '<div><p class="text-sm font-medium text-slate-900">' + t.name + '</p></div>' +
       '<div class="flex items-center gap-3">' +
         '<span class="text-[11px] text-slate-400">' + (state.eventCounts[t.id] || 0) + ' events tracked</span>' +
         badge(t.status, t.status === 'running' ? 'live' : 'ended') +
@@ -300,7 +326,23 @@ function renderTestDetail() {
 
   const rangeButtons = [7, 14, 30].map(d => (
     '<button data-range="' + d + '" class="text-xs px-2.5 py-1 rounded-md ' +
-    (state.rangeDays === d ? 'bg-indigo-700 text-white' : 'text-slate-500 hover:bg-slate-50') + '">' + d + 'd</button>'
+    (!state.useCustomRange && state.rangeDays === d ? 'bg-indigo-700 text-white' : 'text-slate-500 hover:bg-slate-50') + '">' + d + 'd</button>'
+  )).join('') +
+    '<button data-toggle-custom-range class="text-xs px-2.5 py-1 rounded-md ' +
+    (state.useCustomRange ? 'bg-indigo-700 text-white' : 'text-slate-500 hover:bg-slate-50') + '">Custom</button>';
+
+  const customRangeInputs = state.useCustomRange ? (
+    '<div class="flex items-center gap-1.5 bg-white border border-slate-200 rounded-lg px-2 py-1">' +
+      '<input type="date" id="customFromInput" value="' + state.customFrom + '" class="text-xs border-none outline-none text-slate-600" />' +
+      '<span class="text-slate-300 text-xs">&rarr;</span>' +
+      '<input type="date" id="customToInput" value="' + state.customTo + '" class="text-xs border-none outline-none text-slate-600" />' +
+      '<button data-apply-custom-range class="text-xs font-medium text-indigo-700 px-2">Apply</button>' +
+    '</div>'
+  ) : '';
+
+  const deviceButtons = ['all', 'desktop', 'mobile'].map(d => (
+    '<button data-device="' + d + '" class="text-xs px-2.5 py-1 rounded-md ' +
+    (state.device === d ? 'bg-indigo-700 text-white' : 'text-slate-500 hover:bg-slate-50') + '">' + (d === 'all' ? 'All devices' : d[0].toUpperCase() + d.slice(1)) + '</button>'
   )).join('');
 
   return (
@@ -311,9 +353,11 @@ function renderTestDetail() {
         '<p class="text-xs text-slate-400 mt-0.5 font-mono">' + (test ? test.shoplift_key : '') + '</p></div>' +
         badge(test ? test.status : '', test && test.status === 'running' ? 'live' : 'ended') +
       '</div>' +
-      '<div class="flex items-center gap-2 mb-5">' +
+      '<div class="flex items-center gap-2 mb-5 flex-wrap">' +
         '<div class="inline-flex bg-white border border-slate-200 rounded-lg p-0.5">' + rangeButtons + '</div>' +
-        '<span class="text-[11px] text-slate-400 ml-1">last ' + state.rangeDays + ' days</span>' +
+        customRangeInputs +
+        (!state.useCustomRange ? '<span class="text-[11px] text-slate-400 ml-1">last ' + state.rangeDays + ' days</span>' : '') +
+        '<div class="inline-flex bg-white border border-slate-200 rounded-lg p-0.5 ml-1">' + deviceButtons + '</div>' +
       '</div>' +
       '<div class="grid grid-cols-2 gap-5 mb-5">' +
         '<div class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm">' +
@@ -446,6 +490,28 @@ function wireEvents() {
   document.querySelectorAll('[data-range]').forEach(el => {
     el.addEventListener('click', async () => {
       state.rangeDays = parseInt(el.getAttribute('data-range'), 10);
+      state.useCustomRange = false;
+      await loadFunnelAndSeries();
+      render();
+    });
+  });
+  const toggleCustomRange = document.querySelector('[data-toggle-custom-range]');
+  if (toggleCustomRange) toggleCustomRange.addEventListener('click', async () => {
+    state.useCustomRange = !state.useCustomRange;
+    if (!state.useCustomRange) { await loadFunnelAndSeries(); }
+    render();
+  });
+  const applyCustomRange = document.querySelector('[data-apply-custom-range]');
+  if (applyCustomRange) applyCustomRange.addEventListener('click', async () => {
+    state.customFrom = document.getElementById('customFromInput').value;
+    state.customTo = document.getElementById('customToInput').value;
+    if (!state.customFrom) return;
+    await loadFunnelAndSeries();
+    render();
+  });
+  document.querySelectorAll('[data-device]').forEach(el => {
+    el.addEventListener('click', async () => {
+      state.device = el.getAttribute('data-device');
       await loadFunnelAndSeries();
       render();
     });
