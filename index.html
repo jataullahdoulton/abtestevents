@@ -28,6 +28,7 @@ let state = {
   experiments: [],
   events: [],
   eventCounts: {},
+  allEventNames: [],
   testId: null,
   selectedEvent: null,
   rangeDays: 14,
@@ -37,10 +38,13 @@ let state = {
   device: 'all',
   funnel: [],
   series: [],
+  overviewSeries: [],
+  overviewChart: null,
   chart: null,
   showAddTest: false,
   addTestError: '',
   editingTestId: null,
+  confirmingDeleteId: null,
   showAddEvent: false,
   addEventError: '',
   addEventProgression: [],
@@ -50,8 +54,6 @@ let state = {
   lastLiveEvent: null,
 };
 
-const PROGRESSION_OPTIONS = ['view_pdp', 'click_add_to_cart', 'view_cart', 'view_checkout', 'purchase'];
-
 async function api(path, opts) {
   const res = await fetch(SUPABASE_URL + '/rest/v1/' + path, { headers, ...opts });
   if (!res.ok) throw new Error(await res.text());
@@ -60,15 +62,48 @@ async function api(path, opts) {
 
 async function loadExperiments() {
   state.experiments = await api('experiments?select=*&order=created_at.asc');
-  const te = await api('tracked_events?select=id,experiment_id');
+  const te = await api('tracked_events?select=id,name,experiment_id');
   state.eventCounts = {};
   te.forEach(e => {
     if (e.experiment_id) state.eventCounts[e.experiment_id] = (state.eventCounts[e.experiment_id] || 0) + 1;
   });
+  state.allEventNames = te.map(e => e.name);
 }
 
 async function loadEventsForTest(testId) {
   state.events = await api('tracked_events?select=*&experiment_id=eq.' + testId + '&order=created_at.asc');
+  const te = await api('tracked_events?select=name');
+  state.allEventNames = te.map(e => e.name);
+}
+
+function bucketLabel(createdAt) {
+  const d = new Date(createdAt);
+  return state.rangeDays === 'today' && !state.useCustomRange
+    ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+async function loadTestOverview() {
+  if (!state.events.length) { state.overviewSeries = []; return; }
+
+  const { fromDate, toDate } = getActiveRange();
+  const devicePayload = state.device === 'all' ? null : state.device;
+  const eventNames = state.events.map(e => e.name);
+
+  let query = 'experiment_events?select=variant,created_at&event_name=in.(' +
+    eventNames.map(n => encodeURIComponent(n)).join(',') + ')' +
+    '&created_at=gte.' + encodeURIComponent(fromDate) + '&order=created_at.asc';
+  if (toDate) query += '&created_at=lte.' + encodeURIComponent(toDate);
+  if (devicePayload) query += '&device_type=eq.' + encodeURIComponent(devicePayload);
+
+  const rows = await api(query);
+  const byDay = {};
+  rows.forEach(r => {
+    const day = bucketLabel(r.created_at);
+    if (!byDay[day]) byDay[day] = { date: day, control: 0, variant_a: 0 };
+    byDay[day][r.variant || 'unknown'] = (byDay[day][r.variant || 'unknown'] || 0) + 1;
+  });
+  state.overviewSeries = Object.values(byDay);
 }
 
 async function loadFunnelAndSeries() {
@@ -113,7 +148,7 @@ async function loadFunnelAndSeries() {
   const rows = await api(seriesQuery);
   const byDay = {};
   rows.forEach(r => {
-    const day = new Date(r.created_at).toLocaleDateString([], { month: 'short', day: 'numeric' });
+    const day = bucketLabel(r.created_at);
     if (!byDay[day]) byDay[day] = { date: day, control: 0, variant_a: 0 };
     byDay[day][r.variant || 'unknown'] = (byDay[day][r.variant || 'unknown'] || 0) + 1;
   });
@@ -125,6 +160,11 @@ function getActiveRange() {
     const fromDate = new Date(state.customFrom + 'T00:00:00Z').toISOString();
     const toDate = state.customTo ? new Date(state.customTo + 'T23:59:59Z').toISOString() : null;
     return { fromDate, toDate };
+  }
+  if (state.rangeDays === 'today') {
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    return { fromDate: startOfToday.toISOString(), toDate: null };
   }
   return { fromDate: new Date(Date.now() - state.rangeDays * 86400000).toISOString(), toDate: null };
 }
@@ -148,6 +188,14 @@ async function updateExperiment(id, name, shopliftKey) {
     body: JSON.stringify({ name, shoplift_key: shopliftKey }),
   }).then(r => r.json());
   return rows[0];
+}
+
+async function deleteExperiment(id) {
+  const res = await fetch(SUPABASE_URL + '/rest/v1/experiments?id=eq.' + id, {
+    method: 'DELETE',
+    headers,
+  });
+  if (!res.ok) throw new Error(await res.text());
 }
 
 async function createTrackedEvent(experimentId, name, type, target, progression) {
@@ -181,8 +229,12 @@ function subscribeRealtime() {
     .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'experiment_events' }, async (payload) => {
       state.lastLiveEvent = payload.new;
       const evt = state.events.find(e => e.name === state.selectedEvent);
+      const belongsToTest = state.events.some(e => e.name === payload.new.event_name);
       if (evt && payload.new.event_name === evt.name) {
         await loadFunnelAndSeries();
+      }
+      if (belongsToTest) {
+        await loadTestOverview();
       }
       renderLiveOnly();
     })
@@ -204,9 +256,17 @@ function renderLiveOnly() {
   if (label) label.textContent = state.liveConnected
     ? (state.lastLiveEvent ? 'live \u2014 last: ' + state.lastLiveEvent.event_name : 'live')
     : 'connecting\u2026';
+  const overviewDot = document.getElementById('overviewLiveDot');
+  if (overviewDot) {
+    overviewDot.style.background = state.liveConnected ? '#10B981' : '#CBD5E1';
+    overviewDot.style.opacity = state.liveConnected && state.livePulse ? '1' : '0.3';
+  }
+  const overviewPanel = document.getElementById('overviewPanel');
+  if (overviewPanel) overviewPanel.innerHTML = renderOverviewPanelInner();
   const funnelPanel = document.getElementById('funnelPanel');
   if (funnelPanel) funnelPanel.innerHTML = renderFunnelPanelInner();
   if (document.getElementById('seriesChart')) drawChart();
+  if (document.getElementById('overviewChart')) drawOverviewChart();
 }
 
 function badge(text, tone) {
@@ -215,16 +275,31 @@ function badge(text, tone) {
 }
 
 function renderPicker() {
-  const rows = state.experiments.map(t => (
-    '<div data-open-test="' + t.id + '" class="w-full flex items-center justify-between bg-white border border-slate-200 rounded-lg p-4 shadow-sm hover:border-indigo-300 hover:shadow cursor-pointer">' +
-      '<div><p class="text-sm font-medium text-slate-900">' + t.name + '</p></div>' +
-      '<div class="flex items-center gap-3">' +
-        '<span class="text-[11px] text-slate-400">' + (state.eventCounts[t.id] || 0) + ' events tracked</span>' +
-        badge(t.status, t.status === 'running' ? 'live' : 'ended') +
-        '<button data-edit-test="' + t.id + '" class="text-slate-400 hover:text-indigo-700 text-xs px-1" title="Edit test">&#9998;</button>' +
-      '</div>' +
-    '</div>'
-  )).join('');
+  const rows = state.experiments.map(t => {
+    if (state.confirmingDeleteId === t.id) {
+      return (
+        '<div class="w-full flex items-center justify-between bg-rose-50 border border-rose-200 rounded-lg p-4">' +
+          '<div><p class="text-sm font-medium text-rose-900">Delete "' + t.name + '"?</p>' +
+          '<p class="text-[11px] text-rose-500 mt-0.5">This removes the test and its tracked events. Shared funnel history and raw event logs are kept.</p></div>' +
+          '<div class="flex items-center gap-2 shrink-0 ml-3">' +
+            '<button data-confirm-delete-test="' + t.id + '" class="text-xs font-medium bg-rose-600 text-white rounded-md px-3 py-1.5 hover:bg-rose-700">Delete</button>' +
+            '<button data-cancel-delete-test class="text-xs text-slate-500 rounded-md px-3 py-1.5 hover:bg-slate-100">Cancel</button>' +
+          '</div>' +
+        '</div>'
+      );
+    }
+    return (
+      '<div data-open-test="' + t.id + '" class="w-full flex items-center justify-between bg-white border border-slate-200 rounded-lg p-4 shadow-sm hover:border-indigo-300 hover:shadow cursor-pointer">' +
+        '<div><p class="text-sm font-medium text-slate-900">' + t.name + '</p></div>' +
+        '<div class="flex items-center gap-3">' +
+          '<span class="text-[11px] text-slate-400">' + (state.eventCounts[t.id] || 0) + ' events tracked</span>' +
+          badge(t.status, t.status === 'running' ? 'live' : 'ended') +
+          '<button data-edit-test="' + t.id + '" class="text-slate-400 hover:text-indigo-700 text-xs px-1" title="Edit test">&#9998;</button>' +
+          '<button data-delete-test="' + t.id + '" class="text-slate-400 hover:text-rose-600 text-xs px-1" title="Delete test">&#128465;</button>' +
+        '</div>' +
+      '</div>'
+    );
+  }).join('');
 
   const editing = state.editingTestId ? state.experiments.find(t => t.id === state.editingTestId) : null;
   const formOpen = state.showAddTest || editing;
@@ -324,10 +399,13 @@ function renderTestDetail() {
       )).join('')
     : '<p class="text-xs text-slate-400 py-4 text-center">No events set up for this test yet.</p>';
 
-  const rangeButtons = [7, 14, 30].map(d => (
-    '<button data-range="' + d + '" class="text-xs px-2.5 py-1 rounded-md ' +
-    (!state.useCustomRange && state.rangeDays === d ? 'bg-indigo-700 text-white' : 'text-slate-500 hover:bg-slate-50') + '">' + d + 'd</button>'
-  )).join('') +
+  const rangeButtons =
+    '<button data-range="today" class="text-xs px-2.5 py-1 rounded-md ' +
+    (!state.useCustomRange && state.rangeDays === 'today' ? 'bg-indigo-700 text-white' : 'text-slate-500 hover:bg-slate-50') + '">Today</button>' +
+    [7, 14, 30].map(d => (
+      '<button data-range="' + d + '" class="text-xs px-2.5 py-1 rounded-md ' +
+      (!state.useCustomRange && state.rangeDays === d ? 'bg-indigo-700 text-white' : 'text-slate-500 hover:bg-slate-50') + '">' + d + 'd</button>'
+    )).join('') +
     '<button data-toggle-custom-range class="text-xs px-2.5 py-1 rounded-md ' +
     (state.useCustomRange ? 'bg-indigo-700 text-white' : 'text-slate-500 hover:bg-slate-50') + '">Custom</button>';
 
@@ -356,9 +434,10 @@ function renderTestDetail() {
       '<div class="flex items-center gap-2 mb-5 flex-wrap">' +
         '<div class="inline-flex bg-white border border-slate-200 rounded-lg p-0.5">' + rangeButtons + '</div>' +
         customRangeInputs +
-        (!state.useCustomRange ? '<span class="text-[11px] text-slate-400 ml-1">last ' + state.rangeDays + ' days</span>' : '') +
+        (!state.useCustomRange ? '<span class="text-[11px] text-slate-400 ml-1">' + (state.rangeDays === 'today' ? 'today' : 'last ' + state.rangeDays + ' days') + '</span>' : '') +
         '<div class="inline-flex bg-white border border-slate-200 rounded-lg p-0.5 ml-1">' + deviceButtons + '</div>' +
       '</div>' +
+      '<div id="overviewPanel" class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm mb-5">' + renderOverviewPanelInner() + '</div>' +
       '<div class="grid grid-cols-2 gap-5 mb-5">' +
         '<div class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm">' +
           '<div class="flex items-center justify-between mb-4">' +
@@ -387,7 +466,9 @@ function renderAddEventForm() {
   const typeOptions = ['click', 'pageview'].map(t =>
     '<option value="' + t + '"' + (state.addEventType === t ? ' selected' : '') + '>' + (t === 'click' ? 'Click' : 'Pageview') + '</option>'
   ).join('');
-  const progressionChips = PROGRESSION_OPTIONS.map(name => {
+  const progressionChips = state.allEventNames
+    .filter(name => name !== (document.getElementById('newEventName') ? document.getElementById('newEventName').value.trim() : ''))
+    .map(name => {
     const on = state.addEventProgression.includes(name);
     return '<button type="button" data-toggle-progression="' + name + '" class="text-[11px] font-mono px-2 py-1 rounded border ' +
       (on ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-white border-slate-300 text-slate-500') + '">' + name + '</button>';
@@ -415,6 +496,69 @@ function renderAddEventForm() {
   );
 }
 
+function renderOverviewPanelInner() {
+  const totalControl = state.overviewSeries.reduce((a, s) => a + (s.control || 0), 0);
+  const totalVariant = state.overviewSeries.reduce((a, s) => a + (s.variant_a || 0), 0);
+  const uplift = totalControl ? Math.round(((totalVariant - totalControl) / totalControl) * 100) : 0;
+
+  return (
+    '<div class="flex items-center justify-between mb-1">' +
+      '<div>' +
+        '<div class="flex items-center gap-2">' +
+          '<span id="overviewLiveDot" style="width:6px;height:6px;border-radius:50%;display:inline-block;background:#CBD5E1"></span>' +
+          '<p class="text-[11px] font-semibold text-slate-400 uppercase tracking-wide">All events, this test</p>' +
+        '</div>' +
+        '<p class="text-sm text-slate-800 mt-0.5">Control vs variant, updates live as events land</p>' +
+      '</div>' +
+      '<div class="flex gap-3 text-xs text-slate-500">' +
+        '<span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-sm inline-block" style="background:' + VARIANT_COLORS.control + '"></span>control &middot; <span class="font-mono text-slate-700">' + totalControl + '</span></span>' +
+        '<span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-sm inline-block" style="background:' + VARIANT_COLORS.variant_a + '"></span>variant_a &middot; <span class="font-mono text-slate-700">' + totalVariant + '</span></span>' +
+        '<span class="font-medium ' + (uplift >= 0 ? 'text-emerald-600' : 'text-rose-600') + '">' + (uplift >= 0 ? '+' : '') + uplift + '%</span>' +
+      '</div>' +
+    '</div>' +
+    (state.overviewSeries.length
+      ? '<div style="position:relative;height:200px" class="mt-3"><canvas id="overviewChart" role="img" aria-label="Line chart of all tracked events for this test over time, control versus variant_a"></canvas></div>'
+      : '<p class="text-xs text-slate-400 py-8 text-center">No events recorded yet for this range.</p>'
+    )
+  );
+}
+
+function drawOverviewChart() {
+  if (state.overviewChart) { state.overviewChart.destroy(); state.overviewChart = null; }
+  const canvas = document.getElementById('overviewChart');
+  if (!canvas || !state.overviewSeries.length) return;
+  state.overviewChart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: state.overviewSeries.map(s => s.date),
+      datasets: [
+        { label: 'control', data: state.overviewSeries.map(s => s.control || 0), borderColor: VARIANT_COLORS.control, backgroundColor: 'transparent', tension: 0.3 },
+        { label: 'variant_a', data: state.overviewSeries.map(s => s.variant_a || 0), borderColor: VARIANT_COLORS.variant_a, backgroundColor: 'transparent', tension: 0.3 },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            afterBody: (items) => {
+              const c = items.find(i => i.dataset.label === 'control');
+              const v = items.find(i => i.dataset.label === 'variant_a');
+              if (!c || !v || !c.parsed.y) return '';
+              const pct = Math.round(((v.parsed.y - c.parsed.y) / c.parsed.y) * 100);
+              return (pct >= 0 ? '+' : '') + pct + '% vs control';
+            },
+          },
+        },
+      },
+      scales: { y: { beginAtZero: true } },
+    },
+  });
+}
+
 function drawChart() {
   if (state.chart) { state.chart.destroy(); state.chart = null; }
   const canvas = document.getElementById('seriesChart');
@@ -431,6 +575,7 @@ function drawChart() {
     options: {
       responsive: true,
       maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
       plugins: {
         legend: { display: false },
         tooltip: {
@@ -454,13 +599,13 @@ async function render() {
   const app = document.getElementById('app');
   app.innerHTML = state.view === 'picker' ? renderPicker() : renderTestDetail();
   wireEvents();
-  if (state.view === 'test') drawChart();
+  if (state.view === 'test') { drawChart(); drawOverviewChart(); }
 }
 
 function wireEvents() {
   document.querySelectorAll('[data-open-test]').forEach(el => {
     el.addEventListener('click', async (ev) => {
-      if (ev.target.closest('[data-edit-test]')) return;
+      if (ev.target.closest('[data-edit-test]') || ev.target.closest('[data-delete-test]')) return;
       state.testId = el.getAttribute('data-open-test');
       state.view = 'test';
       state.showAddEvent = false;
@@ -468,6 +613,7 @@ function wireEvents() {
       await loadEventsForTest(state.testId);
       state.selectedEvent = state.events[0] ? state.events[0].name : null;
       if (state.selectedEvent) await loadFunnelAndSeries();
+      await loadTestOverview();
       render();
     });
   });
@@ -477,8 +623,39 @@ function wireEvents() {
       state.editingTestId = el.getAttribute('data-edit-test');
       state.showAddTest = false;
       state.addTestError = '';
+      state.confirmingDeleteId = null;
       render();
     });
+  });
+  document.querySelectorAll('[data-delete-test]').forEach(el => {
+    el.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      state.confirmingDeleteId = el.getAttribute('data-delete-test');
+      state.editingTestId = null;
+      state.showAddTest = false;
+      render();
+    });
+  });
+  const cancelDelete = document.querySelector('[data-cancel-delete-test]');
+  if (cancelDelete) cancelDelete.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    state.confirmingDeleteId = null;
+    render();
+  });
+  const confirmDelete = document.querySelector('[data-confirm-delete-test]');
+  if (confirmDelete) confirmDelete.addEventListener('click', async (ev) => {
+    ev.stopPropagation();
+    const id = confirmDelete.getAttribute('data-confirm-delete-test');
+    try {
+      await deleteExperiment(id);
+      state.confirmingDeleteId = null;
+      await loadExperiments();
+      render();
+    } catch (e) {
+      state.confirmingDeleteId = null;
+      alert('Could not delete: ' + e.message);
+      render();
+    }
   });
   document.querySelectorAll('[data-select-event]').forEach(el => {
     el.addEventListener('click', async () => {
@@ -489,16 +666,18 @@ function wireEvents() {
   });
   document.querySelectorAll('[data-range]').forEach(el => {
     el.addEventListener('click', async () => {
-      state.rangeDays = parseInt(el.getAttribute('data-range'), 10);
+      const rangeValue = el.getAttribute('data-range');
+      state.rangeDays = rangeValue === 'today' ? 'today' : parseInt(rangeValue, 10);
       state.useCustomRange = false;
       await loadFunnelAndSeries();
+      await loadTestOverview();
       render();
     });
   });
   const toggleCustomRange = document.querySelector('[data-toggle-custom-range]');
   if (toggleCustomRange) toggleCustomRange.addEventListener('click', async () => {
     state.useCustomRange = !state.useCustomRange;
-    if (!state.useCustomRange) { await loadFunnelAndSeries(); }
+    if (!state.useCustomRange) { await loadFunnelAndSeries(); await loadTestOverview(); }
     render();
   });
   const applyCustomRange = document.querySelector('[data-apply-custom-range]');
@@ -507,12 +686,14 @@ function wireEvents() {
     state.customTo = document.getElementById('customToInput').value;
     if (!state.customFrom) return;
     await loadFunnelAndSeries();
+    await loadTestOverview();
     render();
   });
   document.querySelectorAll('[data-device]').forEach(el => {
     el.addEventListener('click', async () => {
       state.device = el.getAttribute('data-device');
       await loadFunnelAndSeries();
+      await loadTestOverview();
       render();
     });
   });
@@ -590,6 +771,7 @@ function wireEvents() {
       await loadEventsForTest(state.testId);
       state.selectedEvent = name;
       await loadFunnelAndSeries();
+      await loadTestOverview();
       render();
     } catch (e) {
       state.addEventError = 'Could not save: ' + e.message;
