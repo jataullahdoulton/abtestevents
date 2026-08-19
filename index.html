@@ -102,24 +102,23 @@ async function loadFunnelAndSeries() {
   state.series = Object.values(byDay);
 }
 
-async function createExperiment(name, shopliftKey, controlId, variantId) {
+async function createExperiment(name, shopliftKey) {
   const rows = await fetch(SUPABASE_URL + '/rest/v1/experiments', {
     method: 'POST',
     headers: { ...headers, Prefer: 'return=representation' },
     body: JSON.stringify({
       name, shoplift_key: shopliftKey,
-      control_hypothesis_id: controlId, variant_hypothesis_id: variantId,
       variant_labels: { '0': 'control', '1': 'variant_a' }, status: 'running',
     }),
   }).then(r => r.json());
   return rows[0];
 }
 
-async function updateExperiment(id, name, shopliftKey, controlId, variantId) {
+async function updateExperiment(id, name, shopliftKey) {
   const rows = await fetch(SUPABASE_URL + '/rest/v1/experiments?id=eq.' + id, {
     method: 'PATCH',
     headers: { ...headers, Prefer: 'return=representation' },
-    body: JSON.stringify({ name, shoplift_key: shopliftKey, control_hypothesis_id: controlId, variant_hypothesis_id: variantId }),
+    body: JSON.stringify({ name, shoplift_key: shopliftKey }),
   }).then(r => r.json());
   return rows[0];
 }
@@ -209,13 +208,9 @@ function renderPicker() {
       '<p class="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">' + (editing ? 'Edit test' : 'New test') + '</p>' +
       '<div><label class="text-[11px] text-slate-500 block mb-1">Test name</label>' +
       '<input id="newTestName" value="' + (editing ? editing.name : '') + '" placeholder="Homepage redesign" class="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5" /></div>' +
-      '<div><label class="text-[11px] text-slate-500 block mb-1">Internal label (optional)</label>' +
-      '<input id="newTestKey" value="' + (editing ? (editing.shoplift_key || '') : '') + '" placeholder="DLTN04" class="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5 font-mono" /></div>' +
-      '<div><label class="text-[11px] text-slate-500 block mb-1">Control hypothesis ID</label>' +
-      '<input id="newTestControlId" value="' + (editing ? (editing.control_hypothesis_id || '') : '') + '" placeholder="e.g. 3f9a1c2e-..." class="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5 font-mono" /></div>' +
-      '<div><label class="text-[11px] text-slate-500 block mb-1">Variant hypothesis ID</label>' +
-      '<input id="newTestVariantId" value="' + (editing ? (editing.variant_hypothesis_id || '') : '') + '" placeholder="e.g. 7b2d4f88-..." class="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5 font-mono" /></div>' +
-      '<p class="text-[10px] text-slate-400">Find both on the test\'s report page in Shoplift, hover the info icon next to the Original and Variant titles. Whichever ID shows up in a visitor\'s <code>exp_variant_string</code> tells us which arm they saw.</p>' +
+      '<div><label class="text-[11px] text-slate-500 block mb-1">Shoplift test ID</label>' +
+      '<input id="newTestKey" value="' + (editing ? (editing.shoplift_key || '') : '') + '" placeholder="01a01438-0ad4-7367-b76b-d8a41e1be3b0" class="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5 font-mono" />' +
+      '<p class="text-[10px] text-slate-400 mt-1">Open the console on a page in this test and run <code>await window.shoplift.getVisitorData()</code>, copy testId from visitorTests. Control vs variant is read live from Shoplift, nothing else to configure.</p></div>' +
       (state.addTestError ? '<p class="text-xs text-rose-600">' + state.addTestError + '</p>' : '') +
       '<div class="flex gap-2 pt-1">' +
         '<button data-save-test="' + (editing ? editing.id : '') + '" class="text-xs font-medium bg-indigo-700 text-white rounded-md px-3 py-1.5 hover:bg-indigo-800">' + (editing ? 'Save changes' : 'Save test') + '</button>' +
@@ -479,14 +474,12 @@ function wireEvents() {
     const editId = saveTest.getAttribute('data-save-test');
     const name = document.getElementById('newTestName').value.trim();
     const key = document.getElementById('newTestKey').value.trim();
-    const controlId = document.getElementById('newTestControlId').value.trim();
-    const variantId = document.getElementById('newTestVariantId').value.trim();
-    if (!name || !controlId || !variantId) { state.addTestError = 'Add a name and both hypothesis IDs before saving.'; render(); return; }
+    if (!name || !key) { state.addTestError = 'Add a name and the Shoplift test ID before saving.'; render(); return; }
     try {
       if (editId) {
-        await updateExperiment(editId, name, key, controlId, variantId);
+        await updateExperiment(editId, name, key);
       } else {
-        await createExperiment(name, key, controlId, variantId);
+        await createExperiment(name, key);
       }
       state.showAddTest = false;
       state.editingTestId = null;
