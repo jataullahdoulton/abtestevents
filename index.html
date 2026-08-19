@@ -30,6 +30,7 @@ let state = {
   eventCounts: {},
   allEventNames: [],
   allEventConfigs: [],
+  selectedCopyEventIds: [],
   eventRequests: [],
   askClaudeError: '',
   testId: null,
@@ -238,6 +239,27 @@ function suggestEventName(type, target) {
     .replace(/^_+|_+$/g, '');
   const prefix = type === 'pageview' ? 'view' : 'click';
   return prefix + '_' + (base || 'event');
+}
+
+function uniqueEventName(base) {
+  if (!state.allEventNames.includes(base)) return base;
+  let i = 2;
+  while (state.allEventNames.includes(base + '_' + i)) i++;
+  return base + '_' + i;
+}
+
+async function addSelectedStoredEvents() {
+  for (const id of state.selectedCopyEventIds) {
+    const cfg = state.allEventConfigs.find(e => e.id === id);
+    if (!cfg) continue;
+    const name = uniqueEventName(cfg.name);
+    await createTrackedEvent(state.testId, name, cfg.event_type, cfg.match_value);
+    state.allEventNames.push(name);
+  }
+  state.selectedCopyEventIds = [];
+  await loadEventsForTest(state.testId);
+  await loadAvailablePages();
+  await loadTestOverview();
 }
 
 async function createTrackedEvent(experimentId, name, type, target) {
@@ -518,15 +540,24 @@ function renderAddEventForm() {
   )).join('');
 
   const storedEventsList = state.allEventConfigs.length ? (
-    '<div class="' + (state.allEventConfigs.length > 4 ? 'max-h-40 overflow-y-auto' : '') + ' space-y-1.5">' +
-      state.allEventConfigs.map(e => (
-        '<button type="button" data-copy-event="' + e.id + '" class="w-full text-left px-2.5 py-1.5 bg-white border border-slate-200 rounded-md hover:border-indigo-300 hover:bg-indigo-50/40 flex items-center justify-between gap-2">' +
-          '<span class="min-w-0"><span class="text-[11px] font-mono text-slate-700 truncate block">' + e.name + '</span>' +
-          '<span class="text-[10px] text-slate-400 truncate block">' + e.event_type + ' &middot; ' + e.match_value + '</span></span>' +
-        '</button>'
-      )).join('') +
+    '<div class="' + (state.allEventConfigs.length > 8 ? 'max-h-32 overflow-y-auto' : '') + ' flex flex-wrap gap-1.5">' +
+      state.allEventConfigs.map(e => {
+        const selected = state.selectedCopyEventIds.includes(e.id);
+        return (
+          '<button type="button" data-toggle-copy-event="' + e.id + '" title="' + e.event_type + ' \u00b7 ' + e.match_value + '" class="text-[11px] font-mono px-2.5 py-1.5 rounded-md border ' +
+          (selected ? 'bg-indigo-50 border-indigo-300 text-indigo-700' : 'bg-white border-slate-200 text-slate-600 hover:border-indigo-300') + '">' +
+            (selected ? '\u2713 ' : '') + e.name +
+          '</button>'
+        );
+      }).join('') +
     '</div>'
   ) : '<p class="text-[11px] text-slate-400">No events stored yet.</p>';
+
+  const addSelectedButton = state.selectedCopyEventIds.length ? (
+    '<button data-add-selected-events class="mt-2 text-[11px] font-medium bg-indigo-700 text-white rounded-md px-2.5 py-1.5 hover:bg-indigo-800">' +
+      'Add ' + state.selectedCopyEventIds.length + ' selected event' + (state.selectedCopyEventIds.length > 1 ? 's' : '') + ' to this test' +
+    '</button>'
+  ) : '';
 
   const pendingRequests = state.eventRequests.length ? (
     '<div class="space-y-1.5">' +
@@ -564,6 +595,7 @@ function renderAddEventForm() {
         '</div>' +
         '<label class="text-[10px] text-slate-400 block mb-1">Or pick from events already stored</label>' +
         storedEventsList +
+        addSelectedButton +
       '</div>' +
 
       (state.addEventError ? '<p class="text-xs text-rose-600">' + state.addEventError + '</p>' : '') +
@@ -808,7 +840,7 @@ function wireEvents() {
   });
 
   const toggleAddEvent = document.querySelector('[data-toggle-add-event]');
-  if (toggleAddEvent) toggleAddEvent.addEventListener('click', () => { state.showAddEvent = !state.showAddEvent; state.addEventError = ''; render(); });
+  if (toggleAddEvent) toggleAddEvent.addEventListener('click', () => { state.showAddEvent = !state.showAddEvent; state.addEventError = ''; state.selectedCopyEventIds = []; render(); });
 
   const cancelEvent = document.querySelector('[data-cancel-event]');
   if (cancelEvent) cancelEvent.addEventListener('click', () => { state.showAddEvent = false; state.addEventError = ''; render(); });
@@ -826,17 +858,25 @@ function wireEvents() {
     });
   });
 
-  document.querySelectorAll('[data-copy-event]').forEach(el => {
+  document.querySelectorAll('[data-toggle-copy-event]').forEach(el => {
     el.addEventListener('click', () => {
-      const chosen = state.allEventConfigs.find(e => e.id === el.getAttribute('data-copy-event'));
-      if (!chosen) return;
-      state.addEventType = chosen.event_type;
+      const id = el.getAttribute('data-toggle-copy-event');
+      state.selectedCopyEventIds = state.selectedCopyEventIds.includes(id)
+        ? state.selectedCopyEventIds.filter(x => x !== id)
+        : [...state.selectedCopyEventIds, id];
       render();
-      const nameInput = document.getElementById('newEventName');
-      const targetInput2 = document.getElementById('newEventTarget');
-      if (nameInput) nameInput.value = chosen.name;
-      if (targetInput2) targetInput2.value = chosen.match_value;
     });
+  });
+
+  const addSelectedEvents = document.querySelector('[data-add-selected-events]');
+  if (addSelectedEvents) addSelectedEvents.addEventListener('click', async () => {
+    try {
+      await addSelectedStoredEvents();
+      render();
+    } catch (e) {
+      state.addEventError = 'Could not add: ' + e.message;
+      render();
+    }
   });
 
   const targetInput = document.getElementById('newEventTarget');
