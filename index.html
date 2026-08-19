@@ -36,6 +36,8 @@ let state = {
   customTo: '',
   useCustomRange: false,
   device: 'all',
+  pageFilter: 'all',
+  availablePages: [],
   funnel: [],
   series: [],
   overviewSeries: [],
@@ -46,6 +48,7 @@ let state = {
   addTestError: '',
   editingTestId: null,
   confirmingDeleteId: null,
+  confirmingDeleteEventId: null,
   showAddEvent: false,
   addEventError: '',
   addEventProgression: [],
@@ -84,6 +87,15 @@ function bucketLabel(createdAt) {
     : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
+async function loadAvailablePages() {
+  if (!state.events.length) { state.availablePages = []; return; }
+  const eventNames = state.events.map(e => e.name);
+  const rows = await api(
+    'experiment_events?select=page_path&event_name=in.(' + eventNames.map(n => encodeURIComponent(n)).join(',') + ')'
+  );
+  state.availablePages = [...new Set(rows.map(r => r.page_path).filter(Boolean))].sort();
+}
+
 async function loadTestOverview() {
   if (!state.events.length) { state.overviewSeries = []; return; }
 
@@ -96,6 +108,7 @@ async function loadTestOverview() {
     '&created_at=gte.' + encodeURIComponent(fromDate) + '&order=created_at.asc';
   if (toDate) query += '&created_at=lte.' + encodeURIComponent(toDate);
   if (devicePayload) query += '&device_type=eq.' + encodeURIComponent(devicePayload);
+  if (state.pageFilter !== 'all') query += '&page_path=eq.' + encodeURIComponent(state.pageFilter);
 
   const rows = await api(query);
   const byDay = {};
@@ -129,6 +142,7 @@ async function loadFunnelAndSeries() {
         p_device: devicePayload,
         p_start_date: fromDate,
         p_end_date: toDate,
+        p_page_path: state.pageFilter === 'all' ? null : state.pageFilter,
       }),
     });
     const byStep = {};
@@ -145,6 +159,7 @@ async function loadFunnelAndSeries() {
     '&created_at=gte.' + encodeURIComponent(fromDate) + '&order=created_at.asc';
   if (toDate) seriesQuery += '&created_at=lte.' + encodeURIComponent(toDate);
   if (devicePayload) seriesQuery += '&device_type=eq.' + encodeURIComponent(devicePayload);
+  if (state.pageFilter !== 'all') seriesQuery += '&page_path=eq.' + encodeURIComponent(state.pageFilter);
 
   const rows = await api(seriesQuery);
   const byDay = {};
@@ -206,6 +221,14 @@ async function deleteExperiment(id) {
   if (!res.ok) throw new Error(await res.text());
 }
 
+async function deleteTrackedEvent(id) {
+  const res = await fetch(SUPABASE_URL + '/rest/v1/tracked_events?id=eq.' + id, {
+    method: 'DELETE',
+    headers,
+  });
+  if (!res.ok) throw new Error(await res.text());
+}
+
 async function createTrackedEvent(experimentId, name, type, target, progression) {
   const rows = await fetch(SUPABASE_URL + '/rest/v1/tracked_events', {
     method: 'POST',
@@ -255,15 +278,6 @@ function subscribeRealtime() {
 
 function renderLiveOnly() {
   if (state.view !== 'test') return;
-  const dot = document.getElementById('liveDot');
-  if (dot) {
-    dot.style.background = state.liveConnected ? '#10B981' : '#CBD5E1';
-    dot.style.opacity = state.liveConnected && state.livePulse ? '1' : '0.3';
-  }
-  const label = document.getElementById('liveLabel');
-  if (label) label.textContent = state.liveConnected
-    ? (state.lastLiveEvent ? 'live \u2014 last: ' + state.lastLiveEvent.event_name : 'live')
-    : 'connecting\u2026';
   const overviewDot = document.getElementById('overviewLiveDot');
   if (overviewDot) {
     overviewDot.style.background = state.liveConnected ? '#10B981' : '#CBD5E1';
@@ -420,14 +434,33 @@ function renderTestDetail() {
   const test = state.experiments.find(t => t.id === state.testId);
 
   const eventRows = state.events.length
-    ? state.events.map(e => (
-        '<button data-select-event="' + e.name + '" class="flex items-center justify-between py-2.5 border-t border-slate-100 first:border-t-0 text-left w-full px-1.5 -mx-1.5 rounded ' +
-        (state.selectedEvent === e.name ? 'bg-indigo-50/60' : 'hover:bg-slate-50') + '">' +
-          '<div class="min-w-0"><p class="text-xs font-mono text-slate-800 truncate">' + e.name + '</p>' +
-          '<p class="text-[11px] text-slate-400 truncate">' + e.event_type + ' &middot; ' + e.match_value + '</p></div>' +
-          '<span class="w-1.5 h-1.5 rounded-full shrink-0 ml-2 ' + (e.active ? 'bg-emerald-500' : 'bg-slate-300') + '"></span>' +
-        '</button>'
-      )).join('')
+    ? state.events.map(e => {
+        if (state.confirmingDeleteEventId === e.id) {
+          return (
+            '<div class="py-2.5 border-t border-slate-100 first:border-t-0 bg-rose-50 -mx-1.5 px-1.5 rounded">' +
+              '<p class="text-xs font-medium text-rose-900">Remove "' + e.name + '"?</p>' +
+              '<p class="text-[10px] text-rose-500 mt-0.5 mb-2">Stops tracking this event. If other events use it as a downstream progression step, that step will stop updating, not delete.</p>' +
+              '<div class="flex gap-2">' +
+                '<button data-confirm-delete-event="' + e.id + '" class="text-[11px] font-medium bg-rose-600 text-white rounded-md px-2.5 py-1 hover:bg-rose-700">Remove</button>' +
+                '<button data-cancel-delete-event class="text-[11px] text-slate-500 rounded-md px-2.5 py-1 hover:bg-slate-100">Cancel</button>' +
+              '</div>' +
+            '</div>'
+          );
+        }
+        return (
+          '<div class="flex items-center justify-between py-2.5 border-t border-slate-100 first:border-t-0 px-1.5 -mx-1.5 rounded ' +
+          (state.selectedEvent === e.name ? 'bg-indigo-50/60' : 'hover:bg-slate-50') + '">' +
+            '<button data-select-event="' + e.name + '" class="min-w-0 text-left flex-1">' +
+              '<p class="text-xs font-mono text-slate-800 truncate">' + e.name + '</p>' +
+              '<p class="text-[11px] text-slate-400 truncate">' + e.event_type + ' &middot; ' + e.match_value + '</p>' +
+            '</button>' +
+            '<div class="flex items-center gap-2 shrink-0 ml-2">' +
+              '<span class="w-1.5 h-1.5 rounded-full ' + (e.active ? 'bg-emerald-500' : 'bg-slate-300') + '"></span>' +
+              '<button data-delete-event="' + e.id + '" class="text-slate-300 hover:text-rose-600 text-[11px] px-0.5" title="Remove event">&#128465;</button>' +
+            '</div>' +
+          '</div>'
+        );
+      }).join('')
     : '<p class="text-xs text-slate-400 py-4 text-center">No events set up for this test yet.</p>';
 
   const rangeButtons =
@@ -454,6 +487,13 @@ function renderTestDetail() {
     (state.device === d ? 'bg-indigo-700 text-white' : 'text-slate-500 hover:bg-slate-50') + '">' + (d === 'all' ? 'All devices' : d[0].toUpperCase() + d.slice(1)) + '</button>'
   )).join('');
 
+  const pageFilterSelect = state.availablePages.length ? (
+    '<select id="pageFilterSelect" class="text-xs border border-slate-200 rounded-lg px-2 py-1.5 bg-white text-slate-600 max-w-[220px]">' +
+      '<option value="all"' + (state.pageFilter === 'all' ? ' selected' : '') + '>All pages</option>' +
+      state.availablePages.map(p => '<option value="' + p + '"' + (state.pageFilter === p ? ' selected' : '') + '>' + p + '</option>').join('') +
+    '</select>'
+  ) : '';
+
   return (
     '<div>' +
       '<button data-back class="text-[11px] text-slate-400 hover:text-slate-600 mb-1">&larr; All tests</button>' +
@@ -467,26 +507,17 @@ function renderTestDetail() {
         customRangeInputs +
         (!state.useCustomRange ? '<span class="text-[11px] text-slate-400 ml-1">' + (state.rangeDays === 'today' ? 'today' : 'last ' + state.rangeDays + ' days') + '</span>' : '') +
         '<div class="inline-flex bg-white border border-slate-200 rounded-lg p-0.5 ml-1">' + deviceButtons + '</div>' +
+        pageFilterSelect +
+      '</div>' +
+      '<div class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm mb-5">' +
+        '<div class="flex items-center justify-between mb-4">' +
+          '<p class="text-[11px] font-semibold text-slate-400 uppercase tracking-wide">Events for this test</p>' +
+          '<button data-toggle-add-event class="text-xs font-medium text-indigo-700 hover:text-indigo-800">+ Add event</button>' +
+        '</div>' +
+        renderAddEventForm() +
+        '<div class="flex flex-col">' + eventRows + '</div>' +
       '</div>' +
       '<div id="overviewPanel" class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm mb-5">' + renderOverviewPanelInner() + '</div>' +
-      '<div class="grid grid-cols-2 gap-5 mb-5">' +
-        '<div class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm">' +
-          '<div class="flex items-center justify-between mb-4">' +
-            '<p class="text-[11px] font-semibold text-slate-400 uppercase tracking-wide">Events for this test</p>' +
-            '<button data-toggle-add-event class="text-xs font-medium text-indigo-700 hover:text-indigo-800">+ Add event</button>' +
-          '</div>' +
-          renderAddEventForm() +
-          '<div class="flex flex-col">' + eventRows + '</div>' +
-        '</div>' +
-        '<div class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm">' +
-          '<div class="flex items-center gap-2 mb-2">' +
-            '<span id="liveDot" style="width:6px;height:6px;border-radius:50%;display:inline-block;background:#CBD5E1"></span>' +
-            '<p class="text-[11px] font-semibold text-slate-400 uppercase tracking-wide">Live connection</p>' +
-          '</div>' +
-          '<p id="liveLabel" class="text-xs text-slate-400">connecting&hellip;</p>' +
-          '<p class="text-[10px] text-slate-300 mt-2">Numbers below update automatically as events land, no refresh needed.</p>' +
-        '</div>' +
-      '</div>' +
       '<div id="funnelPanel" class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm">' + renderFunnelPanelInner() + '</div>' +
     '</div>'
   );
@@ -644,6 +675,8 @@ function wireEvents() {
       state.showAddEvent = false;
       state.addEventProgression = [];
       await loadEventsForTest(state.testId);
+      state.pageFilter = 'all';
+      await loadAvailablePages();
       state.selectedEvent = state.events[0] ? state.events[0].name : null;
       if (state.selectedEvent) await loadFunnelAndSeries();
       await loadTestOverview();
@@ -697,6 +730,41 @@ function wireEvents() {
       render();
     });
   });
+  document.querySelectorAll('[data-delete-event]').forEach(el => {
+    el.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      state.confirmingDeleteEventId = el.getAttribute('data-delete-event');
+      render();
+    });
+  });
+  const cancelDeleteEvent = document.querySelector('[data-cancel-delete-event]');
+  if (cancelDeleteEvent) cancelDeleteEvent.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    state.confirmingDeleteEventId = null;
+    render();
+  });
+  const confirmDeleteEvent = document.querySelector('[data-confirm-delete-event]');
+  if (confirmDeleteEvent) confirmDeleteEvent.addEventListener('click', async (ev) => {
+    ev.stopPropagation();
+    const id = confirmDeleteEvent.getAttribute('data-confirm-delete-event');
+    const deletedName = (state.events.find(e => e.id === id) || {}).name;
+    try {
+      await deleteTrackedEvent(id);
+      state.confirmingDeleteEventId = null;
+      await loadEventsForTest(state.testId);
+      await loadAvailablePages();
+      if (state.selectedEvent === deletedName) {
+        state.selectedEvent = state.events[0] ? state.events[0].name : null;
+        if (state.selectedEvent) await loadFunnelAndSeries();
+      }
+      await loadTestOverview();
+      render();
+    } catch (e) {
+      state.confirmingDeleteEventId = null;
+      alert('Could not remove: ' + e.message);
+      render();
+    }
+  });
   document.querySelectorAll('[data-range]').forEach(el => {
     el.addEventListener('click', async () => {
       const rangeValue = el.getAttribute('data-range');
@@ -729,6 +797,13 @@ function wireEvents() {
       await loadTestOverview();
       render();
     });
+  });
+  const pageFilterSelect = document.getElementById('pageFilterSelect');
+  if (pageFilterSelect) pageFilterSelect.addEventListener('change', async () => {
+    state.pageFilter = pageFilterSelect.value;
+    await loadFunnelAndSeries();
+    await loadTestOverview();
+    render();
   });
   const back = document.querySelector('[data-back]');
   if (back) back.addEventListener('click', () => { state.view = 'picker'; state.showAddEvent = false; render(); });
@@ -802,6 +877,7 @@ function wireEvents() {
       state.addEventError = '';
       state.addEventProgression = [];
       await loadEventsForTest(state.testId);
+      await loadAvailablePages();
       state.selectedEvent = name;
       await loadFunnelAndSeries();
       await loadTestOverview();
