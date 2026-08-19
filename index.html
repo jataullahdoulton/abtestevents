@@ -40,6 +40,7 @@ let state = {
   series: [],
   overviewSeries: [],
   overviewChart: null,
+  pageBreakdown: [],
   chart: null,
   showAddTest: false,
   addTestError: '',
@@ -140,19 +141,26 @@ async function loadFunnelAndSeries() {
     state.funnel = [];
   }
 
-  let seriesQuery = 'experiment_events?select=variant,created_at&event_name=eq.' + encodeURIComponent(evt.name) +
+  let seriesQuery = 'experiment_events?select=variant,created_at,page_path&event_name=eq.' + encodeURIComponent(evt.name) +
     '&created_at=gte.' + encodeURIComponent(fromDate) + '&order=created_at.asc';
   if (toDate) seriesQuery += '&created_at=lte.' + encodeURIComponent(toDate);
   if (devicePayload) seriesQuery += '&device_type=eq.' + encodeURIComponent(devicePayload);
 
   const rows = await api(seriesQuery);
   const byDay = {};
+  const byPage = {};
   rows.forEach(r => {
     const day = bucketLabel(r.created_at);
     if (!byDay[day]) byDay[day] = { date: day, control: 0, variant_a: 0 };
     byDay[day][r.variant || 'unknown'] = (byDay[day][r.variant || 'unknown'] || 0) + 1;
+
+    const page = r.page_path || '(unknown)';
+    if (!byPage[page]) byPage[page] = { page, control: 0, variant_a: 0, total: 0 };
+    byPage[page][r.variant || 'unknown'] = (byPage[page][r.variant || 'unknown'] || 0) + 1;
+    byPage[page].total += 1;
   });
   state.series = Object.values(byDay);
+  state.pageBreakdown = Object.values(byPage).sort((a, b) => b.total - a.total);
 }
 
 function getActiveRange() {
@@ -381,7 +389,30 @@ function renderFunnelPanelInner() {
     (state.series.length
       ? '<div style="position:relative;height:200px"><canvas id="seriesChart" role="img" aria-label="Line chart of ' + evt.name + ' events over time, control versus variant_a"></canvas></div>'
       : '<p class="text-xs text-slate-400 py-6 text-center">No events recorded yet for this range.</p>'
-    )
+    ) +
+    (state.pageBreakdown.length ? renderPageBreakdown() : '')
+  );
+}
+
+function renderPageBreakdown() {
+  const maxTotal = Math.max(...state.pageBreakdown.map(p => p.total), 1);
+  const rows = state.pageBreakdown.slice(0, 8).map(p => (
+    '<div class="py-1.5">' +
+      '<div class="flex items-center justify-between mb-0.5">' +
+        '<p class="text-[11px] font-mono text-slate-600 truncate max-w-[70%]" title="' + p.page + '">' + p.page + '</p>' +
+        '<span class="text-[11px] text-slate-400 tabular-nums">' + p.total + '</span>' +
+      '</div>' +
+      '<div class="flex gap-0.5">' +
+        '<div class="h-1.5 rounded-l" style="width:' + ((p.control || 0) / maxTotal * 100) + '%;background:' + VARIANT_COLORS.control + '"></div>' +
+        '<div class="h-1.5 rounded-r" style="width:' + ((p.variant_a || 0) / maxTotal * 100) + '%;background:' + VARIANT_COLORS.variant_a + '"></div>' +
+      '</div>' +
+    '</div>'
+  )).join('');
+
+  return (
+    '<p class="text-[11px] font-semibold text-slate-400 uppercase tracking-wide mt-5 mb-1">By page</p>' +
+    '<div class="divide-y divide-slate-100">' + rows + '</div>' +
+    (state.pageBreakdown.length > 8 ? '<p class="text-[10px] text-slate-400 mt-1">Showing top 8 of ' + state.pageBreakdown.length + ' pages.</p>' : '')
   );
 }
 
@@ -539,6 +570,7 @@ function drawOverviewChart() {
     options: {
       responsive: true,
       maintainAspectRatio: false,
+      animation: false,
       interaction: { mode: 'index', intersect: false },
       plugins: {
         legend: { display: false },
@@ -575,6 +607,7 @@ function drawChart() {
     options: {
       responsive: true,
       maintainAspectRatio: false,
+      animation: false,
       interaction: { mode: 'index', intersect: false },
       plugins: {
         legend: { display: false },
