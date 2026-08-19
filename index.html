@@ -29,6 +29,9 @@ let state = {
   events: [],
   eventCounts: {},
   allEventNames: [],
+  allEventConfigs: [],
+  eventRequests: [],
+  askClaudeError: '',
   testId: null,
   selectedEvent: null,
   rangeDays: 14,
@@ -37,6 +40,7 @@ let state = {
   useCustomRange: false,
   device: 'all',
   pageFilter: 'all',
+  pageFilterByTest: {},
   availablePages: [],
   series: [],
   overviewSeries: [],
@@ -73,8 +77,13 @@ async function loadExperiments() {
 
 async function loadEventsForTest(testId) {
   state.events = await api('tracked_events?select=*&experiment_id=eq.' + testId + '&order=created_at.asc');
-  const te = await api('tracked_events?select=name');
+  const te = await api('tracked_events?select=id,name,event_type,match_value&order=created_at.asc');
   state.allEventNames = te.map(e => e.name);
+  state.allEventConfigs = te;
+}
+
+async function loadEventRequests(testId) {
+  state.eventRequests = await api('event_requests?select=*&experiment_id=eq.' + testId + '&status=eq.pending&order=created_at.desc');
 }
 
 function bucketLabel(createdAt) {
@@ -208,6 +217,29 @@ async function deleteTrackedEvent(id) {
   if (!res.ok) throw new Error(await res.text());
 }
 
+async function createEventRequest(experimentId, text) {
+  const res = await fetch(SUPABASE_URL + '/rest/v1/event_requests', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ experiment_id: experimentId, request_text: text }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+}
+
+function suggestEventName(type, target) {
+  if (!target) return '';
+  const base = target
+    .replace(/^[.#\[]+/, '')
+    .replace(/["'\[\]=]/g, ' ')
+    .replace(/[.#\/]/g, ' ')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  const prefix = type === 'pageview' ? 'view' : 'click';
+  return prefix + '_' + (base || 'event');
+}
+
 async function createTrackedEvent(experimentId, name, type, target) {
   const rows = await fetch(SUPABASE_URL + '/rest/v1/tracked_events', {
     method: 'POST',
@@ -237,16 +269,19 @@ function subscribeRealtime() {
       state.liveConnected = status === 'SUBSCRIBED';
       renderLiveOnly();
     });
-  setInterval(() => { state.livePulse = !state.livePulse; renderLiveOnly(); }, 800);
+  setInterval(() => { state.livePulse = !state.livePulse; pulseOnly(); }, 800);
+}
+
+function pulseOnly() {
+  const dot = document.getElementById('mainLiveDot');
+  if (!dot) return;
+  dot.style.background = state.liveConnected ? '#10B981' : '#CBD5E1';
+  dot.style.opacity = state.liveConnected && state.livePulse ? '1' : '0.3';
 }
 
 function renderLiveOnly() {
   if (state.view !== 'test') return;
-  const dot = document.getElementById('mainLiveDot');
-  if (dot) {
-    dot.style.background = state.liveConnected ? '#10B981' : '#CBD5E1';
-    dot.style.opacity = state.liveConnected && state.livePulse ? '1' : '0.3';
-  }
+  pulseOnly();
   const chartPanel = document.getElementById('chartPanel');
   if (chartPanel) chartPanel.innerHTML = renderChartPanelInner();
   if (document.getElementById('mainChart')) drawMainChart();
@@ -480,16 +515,53 @@ function renderAddEventForm() {
     '<option value="' + t + '"' + (state.addEventType === t ? ' selected' : '') + '>' + (t === 'click' ? 'Click' : 'Pageview') + '</option>'
   ).join('');
 
+  const copyOptions = state.allEventConfigs.length ? (
+    '<select id="copyFromEvent" class="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5 bg-white">' +
+      '<option value="">Start from scratch</option>' +
+      state.allEventConfigs.map(e => '<option value="' + e.id + '">' + e.name + ' (' + e.event_type + ')</option>').join('') +
+    '</select>'
+  ) : '';
+
+  const pendingRequests = state.eventRequests.length ? (
+    '<div class="space-y-1.5">' +
+      state.eventRequests.map(r => (
+        '<div class="flex items-center justify-between bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5">' +
+          '<p class="text-[11px] text-amber-800 truncate">' + r.request_text + '</p>' +
+          '<button data-cancel-request="' + r.id + '" class="text-amber-500 hover:text-amber-700 text-[11px] px-1 shrink-0">&times;</button>' +
+        '</div>'
+      )).join('') +
+    '</div>'
+  ) : '';
+
   return (
-    '<div class="mb-4 p-3.5 bg-slate-50 border border-slate-200 rounded-lg space-y-2.5">' +
-      '<div><label class="text-[11px] text-slate-500 block mb-1">Event name</label>' +
-      '<input id="newEventName" placeholder="click_hero_shop_now" class="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5 font-mono" /></div>' +
-      '<div class="flex gap-2">' +
-        '<div class="flex-1"><label class="text-[11px] text-slate-500 block mb-1">Type</label>' +
-        '<select id="newEventType" class="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5 bg-white">' + typeOptions + '</select></div>' +
-        '<div class="flex-[2]"><label class="text-[11px] text-slate-500 block mb-1">' + (state.addEventType === 'pageview' ? 'URL path' : 'CSS selector') + '</label>' +
-        '<input id="newEventTarget" placeholder="' + (state.addEventType === 'pageview' ? '/cart' : '#hero-shop-now') + '" class="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5 font-mono" /></div>' +
+    '<div class="mb-4 p-3.5 bg-slate-50 border border-slate-200 rounded-lg space-y-3">' +
+
+      '<div>' +
+        '<label class="text-[11px] text-slate-500 block mb-1">Ask Claude to set this up</label>' +
+        '<div class="flex gap-1.5">' +
+          '<input id="askClaudeInput" placeholder="e.g. the newsletter signup button in the footer" class="flex-1 text-xs border border-slate-300 rounded-md px-2 py-1.5" />' +
+          '<button data-ask-claude class="text-xs font-medium bg-slate-800 text-white rounded-md px-3 py-1.5 hover:bg-slate-900 shrink-0">Ask</button>' +
+        '</div>' +
+        '<p class="text-[10px] text-slate-400 mt-1">Saves a request, ask Claude to check it next time you\'re chatting, it\'ll find the selector and add the event for you.</p>' +
+        (state.askClaudeError ? '<p class="text-xs text-rose-600 mt-1">' + state.askClaudeError + '</p>' : '') +
+        (pendingRequests ? '<div class="mt-2">' + pendingRequests + '</div>' : '') +
       '</div>' +
+
+      '<div class="border-t border-slate-200 pt-3">' +
+        '<label class="text-[11px] text-slate-500 block mb-1">Or set it up yourself</label>' +
+        (copyOptions ? '<div class="mb-2"><label class="text-[10px] text-slate-400 block mb-1">Copy from an existing event</label>' + copyOptions + '</div>' : '') +
+        '<div class="space-y-2">' +
+          '<div><label class="text-[11px] text-slate-500 block mb-1">Event name</label>' +
+          '<input id="newEventName" placeholder="click_hero_shop_now" class="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5 font-mono" /></div>' +
+          '<div class="flex gap-2">' +
+            '<div class="flex-1"><label class="text-[11px] text-slate-500 block mb-1">Type</label>' +
+            '<select id="newEventType" class="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5 bg-white">' + typeOptions + '</select></div>' +
+            '<div class="flex-[2]"><label class="text-[11px] text-slate-500 block mb-1">' + (state.addEventType === 'pageview' ? 'URL path' : 'CSS selector') + '</label>' +
+            '<input id="newEventTarget" placeholder="' + (state.addEventType === 'pageview' ? '/cart' : '#hero-shop-now') + '" class="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5 font-mono" /></div>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+
       (state.addEventError ? '<p class="text-xs text-rose-600">' + state.addEventError + '</p>' : '') +
       '<div class="flex gap-2 pt-1">' +
         '<button data-save-event class="text-xs font-medium bg-indigo-700 text-white rounded-md px-3 py-1.5 hover:bg-indigo-800">Save event</button>' +
@@ -551,8 +623,11 @@ function wireEvents() {
       state.testId = el.getAttribute('data-open-test');
       state.view = 'test';
       state.showAddEvent = false;
+      state.rangeDays = 'today';
+      state.useCustomRange = false;
       await loadEventsForTest(state.testId);
-      state.pageFilter = 'all';
+      await loadEventRequests(state.testId);
+      state.pageFilter = state.pageFilterByTest[state.testId] || 'all';
       await loadAvailablePages();
       state.selectedEvent = null;
       await loadTestOverview();
@@ -681,6 +756,7 @@ function wireEvents() {
   const pageFilterSelect = document.getElementById('pageFilterSelect');
   if (pageFilterSelect) pageFilterSelect.addEventListener('change', async () => {
     state.pageFilter = pageFilterSelect.value;
+    state.pageFilterByTest[state.testId] = state.pageFilter;
     await loadEventSeries();
     await loadTestOverview();
     render();
@@ -735,6 +811,50 @@ function wireEvents() {
 
   const typeSelect = document.getElementById('newEventType');
   if (typeSelect) typeSelect.addEventListener('change', () => { state.addEventType = typeSelect.value; render(); });
+
+  const copyFromEvent = document.getElementById('copyFromEvent');
+  if (copyFromEvent) copyFromEvent.addEventListener('change', () => {
+    const chosen = state.allEventConfigs.find(e => e.id === copyFromEvent.value);
+    if (!chosen) return;
+    state.addEventType = chosen.event_type;
+    render();
+    // Prefill after re-render so the target field exists with the right type
+    const targetInput = document.getElementById('newEventTarget');
+    if (targetInput) targetInput.value = chosen.match_value;
+  });
+
+  const targetInput = document.getElementById('newEventTarget');
+  if (targetInput) targetInput.addEventListener('blur', () => {
+    const nameInput = document.getElementById('newEventName');
+    if (nameInput && !nameInput.value.trim() && targetInput.value.trim()) {
+      nameInput.value = suggestEventName(state.addEventType, targetInput.value.trim());
+    }
+  });
+
+  const askClaude = document.querySelector('[data-ask-claude]');
+  if (askClaude) askClaude.addEventListener('click', async () => {
+    const input = document.getElementById('askClaudeInput');
+    const text = input.value.trim();
+    if (!text) { state.askClaudeError = 'Describe what you want tracked first.'; render(); return; }
+    try {
+      await createEventRequest(state.testId, text);
+      state.askClaudeError = '';
+      await loadEventRequests(state.testId);
+      render();
+    } catch (e) {
+      state.askClaudeError = 'Could not save: ' + e.message;
+      render();
+    }
+  });
+
+  document.querySelectorAll('[data-cancel-request]').forEach(el => {
+    el.addEventListener('click', async () => {
+      const id = el.getAttribute('data-cancel-request');
+      await fetch(SUPABASE_URL + '/rest/v1/event_requests?id=eq.' + id, { method: 'DELETE', headers });
+      await loadEventRequests(state.testId);
+      render();
+    });
+  });
 
   const saveEvent = document.querySelector('[data-save-event]');
   if (saveEvent) saveEvent.addEventListener('click', async () => {
