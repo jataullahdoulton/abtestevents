@@ -511,16 +511,22 @@ function renderTestDetail() {
 
 function renderAddEventForm() {
   if (!state.showAddEvent) return '';
-  const typeOptions = ['click', 'pageview'].map(t =>
-    '<option value="' + t + '"' + (state.addEventType === t ? ' selected' : '') + '>' + (t === 'click' ? 'Click' : 'Pageview') + '</option>'
-  ).join('');
 
-  const copyOptions = state.allEventConfigs.length ? (
-    '<select id="copyFromEvent" class="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5 bg-white">' +
-      '<option value="">Start from scratch</option>' +
-      state.allEventConfigs.map(e => '<option value="' + e.id + '">' + e.name + ' (' + e.event_type + ')</option>').join('') +
-    '</select>'
-  ) : '';
+  const typeToggle = ['click', 'pageview'].map(t => (
+    '<button type="button" data-set-event-type="' + t + '" class="text-[11px] px-2.5 py-1 rounded-md ' +
+    (state.addEventType === t ? 'bg-indigo-700 text-white' : 'text-slate-500 hover:bg-slate-50') + '">' + (t === 'click' ? 'Click' : 'Pageview') + '</button>'
+  )).join('');
+
+  const storedEventsList = state.allEventConfigs.length ? (
+    '<div class="' + (state.allEventConfigs.length > 4 ? 'max-h-40 overflow-y-auto' : '') + ' border border-slate-200 rounded-md divide-y divide-slate-100">' +
+      state.allEventConfigs.map(e => (
+        '<button type="button" data-copy-event="' + e.id + '" class="w-full text-left px-2.5 py-1.5 hover:bg-slate-50 flex items-center justify-between gap-2">' +
+          '<span class="min-w-0"><span class="text-[11px] font-mono text-slate-700 truncate block">' + e.name + '</span>' +
+          '<span class="text-[10px] text-slate-400 truncate block">' + e.event_type + ' &middot; ' + e.match_value + '</span></span>' +
+        '</button>'
+      )).join('') +
+    '</div>'
+  ) : '<p class="text-[11px] text-slate-400">No events stored yet.</p>';
 
   const pendingRequests = state.eventRequests.length ? (
     '<div class="space-y-1.5">' +
@@ -549,17 +555,15 @@ function renderAddEventForm() {
 
       '<div class="border-t border-slate-200 pt-3">' +
         '<label class="text-[11px] text-slate-500 block mb-1">Or set it up yourself</label>' +
-        (copyOptions ? '<div class="mb-2"><label class="text-[10px] text-slate-400 block mb-1">Copy from an existing event</label>' + copyOptions + '</div>' : '') +
-        '<div class="space-y-2">' +
-          '<div><label class="text-[11px] text-slate-500 block mb-1">Event name</label>' +
+        '<div class="inline-flex bg-white border border-slate-200 rounded-lg p-0.5 mb-2">' + typeToggle + '</div>' +
+        '<div class="flex gap-2 mb-2">' +
+          '<div class="flex-1"><label class="text-[10px] text-slate-400 block mb-1">Event name</label>' +
           '<input id="newEventName" placeholder="click_hero_shop_now" class="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5 font-mono" /></div>' +
-          '<div class="flex gap-2">' +
-            '<div class="flex-1"><label class="text-[11px] text-slate-500 block mb-1">Type</label>' +
-            '<select id="newEventType" class="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5 bg-white">' + typeOptions + '</select></div>' +
-            '<div class="flex-[2]"><label class="text-[11px] text-slate-500 block mb-1">' + (state.addEventType === 'pageview' ? 'URL path' : 'CSS selector') + '</label>' +
-            '<input id="newEventTarget" placeholder="' + (state.addEventType === 'pageview' ? '/cart' : '#hero-shop-now') + '" class="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5 font-mono" /></div>' +
-          '</div>' +
+          '<div class="flex-1"><label class="text-[10px] text-slate-400 block mb-1">' + (state.addEventType === 'pageview' ? 'URL path' : 'CSS selector') + '</label>' +
+          '<input id="newEventTarget" placeholder="' + (state.addEventType === 'pageview' ? '/cart' : '#hero-shop-now') + '" class="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5 font-mono" /></div>' +
         '</div>' +
+        '<label class="text-[10px] text-slate-400 block mb-1">Or pick from events already stored</label>' +
+        storedEventsList +
       '</div>' +
 
       (state.addEventError ? '<p class="text-xs text-rose-600">' + state.addEventError + '</p>' : '') +
@@ -809,18 +813,30 @@ function wireEvents() {
   const cancelEvent = document.querySelector('[data-cancel-event]');
   if (cancelEvent) cancelEvent.addEventListener('click', () => { state.showAddEvent = false; state.addEventError = ''; render(); });
 
-  const typeSelect = document.getElementById('newEventType');
-  if (typeSelect) typeSelect.addEventListener('change', () => { state.addEventType = typeSelect.value; render(); });
+  document.querySelectorAll('[data-set-event-type]').forEach(el => {
+    el.addEventListener('click', () => {
+      const currentName = (document.getElementById('newEventName') || {}).value || '';
+      const currentTarget = (document.getElementById('newEventTarget') || {}).value || '';
+      state.addEventType = el.getAttribute('data-set-event-type');
+      render();
+      const nameInput = document.getElementById('newEventName');
+      const targetInput2 = document.getElementById('newEventTarget');
+      if (nameInput) nameInput.value = currentName;
+      if (targetInput2) targetInput2.value = currentTarget;
+    });
+  });
 
-  const copyFromEvent = document.getElementById('copyFromEvent');
-  if (copyFromEvent) copyFromEvent.addEventListener('change', () => {
-    const chosen = state.allEventConfigs.find(e => e.id === copyFromEvent.value);
-    if (!chosen) return;
-    state.addEventType = chosen.event_type;
-    render();
-    // Prefill after re-render so the target field exists with the right type
-    const targetInput = document.getElementById('newEventTarget');
-    if (targetInput) targetInput.value = chosen.match_value;
+  document.querySelectorAll('[data-copy-event]').forEach(el => {
+    el.addEventListener('click', () => {
+      const chosen = state.allEventConfigs.find(e => e.id === el.getAttribute('data-copy-event'));
+      if (!chosen) return;
+      state.addEventType = chosen.event_type;
+      render();
+      const nameInput = document.getElementById('newEventName');
+      const targetInput2 = document.getElementById('newEventTarget');
+      if (nameInput) nameInput.value = chosen.name;
+      if (targetInput2) targetInput2.value = chosen.match_value;
+    });
   });
 
   const targetInput = document.getElementById('newEventTarget');
