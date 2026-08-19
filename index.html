@@ -83,8 +83,18 @@ async function loadEventsForTest(testId) {
 function bucketLabel(createdAt) {
   const d = new Date(createdAt);
   return state.rangeDays === 'today' && !state.useCustomRange
-    ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    ? d.toLocaleTimeString([], { hour: '2-digit' })
     : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+function toCumulative(seriesArray) {
+  let runningControl = 0;
+  let runningVariant = 0;
+  return seriesArray.map(s => {
+    runningControl += s.control || 0;
+    runningVariant += s.variant_a || 0;
+    return { date: s.date, control: runningControl, variant_a: runningVariant };
+  });
 }
 
 async function loadAvailablePages() {
@@ -117,7 +127,7 @@ async function loadTestOverview() {
     if (!byDay[day]) byDay[day] = { date: day, control: 0, variant_a: 0 };
     byDay[day][r.variant || 'unknown'] = (byDay[day][r.variant || 'unknown'] || 0) + 1;
   });
-  state.overviewSeries = Object.values(byDay);
+  state.overviewSeries = toCumulative(Object.values(byDay));
 }
 
 async function loadFunnelAndSeries() {
@@ -174,7 +184,7 @@ async function loadFunnelAndSeries() {
     byPage[page][r.variant || 'unknown'] = (byPage[page][r.variant || 'unknown'] || 0) + 1;
     byPage[page].total += 1;
   });
-  state.series = Object.values(byDay);
+  state.series = toCumulative(Object.values(byDay));
   state.pageBreakdown = Object.values(byPage).sort((a, b) => b.total - a.total);
 }
 
@@ -559,8 +569,9 @@ function renderAddEventForm() {
 }
 
 function renderOverviewPanelInner() {
-  const totalControl = state.overviewSeries.reduce((a, s) => a + (s.control || 0), 0);
-  const totalVariant = state.overviewSeries.reduce((a, s) => a + (s.variant_a || 0), 0);
+  const lastPoint = state.overviewSeries[state.overviewSeries.length - 1] || { control: 0, variant_a: 0 };
+  const totalControl = lastPoint.control;
+  const totalVariant = lastPoint.variant_a;
   const uplift = totalControl ? Math.round(((totalVariant - totalControl) / totalControl) * 100) : 0;
 
   return (
@@ -594,8 +605,8 @@ function drawOverviewChart() {
     data: {
       labels: state.overviewSeries.map(s => s.date),
       datasets: [
-        { label: 'control', data: state.overviewSeries.map(s => s.control || 0), borderColor: VARIANT_COLORS.control, backgroundColor: 'transparent', tension: 0.3 },
-        { label: 'variant_a', data: state.overviewSeries.map(s => s.variant_a || 0), borderColor: VARIANT_COLORS.variant_a, backgroundColor: 'transparent', tension: 0.3 },
+        { label: 'control', data: state.overviewSeries.map(s => s.control || 0), borderColor: VARIANT_COLORS.control, backgroundColor: 'transparent', tension: 0.4, cubicInterpolationMode: 'monotone', pointRadius: 2, borderWidth: 2 },
+        { label: 'variant_a', data: state.overviewSeries.map(s => s.variant_a || 0), borderColor: VARIANT_COLORS.variant_a, backgroundColor: 'transparent', tension: 0.4, cubicInterpolationMode: 'monotone', pointRadius: 2, borderWidth: 2 },
       ],
     },
     options: {
@@ -631,8 +642,8 @@ function drawChart() {
     data: {
       labels: state.series.map(s => s.date),
       datasets: [
-        { label: 'control', data: state.series.map(s => s.control || 0), borderColor: VARIANT_COLORS.control, backgroundColor: 'transparent', tension: 0.3 },
-        { label: 'variant_a', data: state.series.map(s => s.variant_a || 0), borderColor: VARIANT_COLORS.variant_a, backgroundColor: 'transparent', tension: 0.3 },
+        { label: 'control', data: state.series.map(s => s.control || 0), borderColor: VARIANT_COLORS.control, backgroundColor: 'transparent', tension: 0.4, cubicInterpolationMode: 'monotone', pointRadius: 2, borderWidth: 2 },
+        { label: 'variant_a', data: state.series.map(s => s.variant_a || 0), borderColor: VARIANT_COLORS.variant_a, backgroundColor: 'transparent', tension: 0.4, cubicInterpolationMode: 'monotone', pointRadius: 2, borderWidth: 2 },
       ],
     },
     options: {
