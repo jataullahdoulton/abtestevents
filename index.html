@@ -61,9 +61,29 @@ let state = {
 };
 
 async function api(path, opts) {
-  const res = await fetch(SUPABASE_URL + '/rest/v1/' + path, { headers, ...opts });
-  if (!res.ok) throw new Error(await res.text());
-  return res.json();
+  // GET requests can return more than PostgREST's default 1000-row cap,
+  // page through with Range headers until we've fetched everything.
+  const isGet = !opts || !opts.method || opts.method === 'GET';
+  if (!isGet) {
+    const res = await fetch(SUPABASE_URL + '/rest/v1/' + path, { headers, ...opts });
+    if (!res.ok) throw new Error(await res.text());
+    return res.json();
+  }
+
+  const pageSize = 1000;
+  let offset = 0;
+  let all = [];
+  while (true) {
+    const res = await fetch(SUPABASE_URL + '/rest/v1/' + path, {
+      headers: { ...headers, Range: offset + '-' + (offset + pageSize - 1) },
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const page = await res.json();
+    all = all.concat(page);
+    if (page.length < pageSize) break;
+    offset += pageSize;
+  }
+  return all;
 }
 
 async function loadExperiments() {
